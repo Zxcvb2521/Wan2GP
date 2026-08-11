@@ -25,6 +25,9 @@ def get_timeline():
 def get_model_store():
  from studio_model_store import ModelStore
  return ModelStore(MODEL_DIR)
+def get_runtime_policy():
+ from studio_runtime_policy import RuntimePolicy
+ return RuntimePolicy()
 def jsonable(value:Any)->Any:
  if value is None or isinstance(value,(str,int,float,bool)): return value
  if isinstance(value,Path): return str(value)
@@ -54,7 +57,16 @@ def run_image(job_id,prompt,overrides):
  try:
   session=get_session();job.update(status="preparing",progress=.02);models=session.list_model_metadata(include_availability=True);model_type=str(overrides.get("model_type") or choose_image_model(models) or "").strip()
   if not model_type:raise RuntimeError("WanGP не сообщил доступную модель для генерации изображения")
-  schema=session.get_model_schema(model_type);settings=dict(schema.get("default_settings") or {});settings.update({k:v for k,v in overrides.items() if k!="model_type"});settings.update(model_type=model_type,prompt=prompt);settings.setdefault("repeat_generation",1);settings.setdefault("batch_size",1);job.update(status="running",progress=.05,model_type=model_type,model_name=schema.get("name"));sj=session.submit_task(settings);job["session_job"]=sj
+  schema=session.get_model_schema(model_type);settings=dict(schema.get("default_settings") or {})
+  user_settings={k:v for k,v in overrides.items() if k!="model_type"}
+  settings.update(user_settings)
+  policy=get_runtime_policy()
+  decision=policy.select(model=schema,overrides=user_settings)
+  settings.update(decision.settings)
+  settings.update(model_type=model_type,prompt=prompt)
+  settings.setdefault("repeat_generation",1);settings.setdefault("batch_size",1)
+  job.update(status="running",progress=.05,model_type=model_type,model_name=schema.get("name"),runtime=decision.to_dict())
+  sj=session.submit_task(settings);job["session_job"]=sj
   while not sj.done:
    event=sj.events.get(timeout=.25)
    if event is not None:event_update(job,event)
@@ -62,7 +74,7 @@ def run_image(job_id,prompt,overrides):
   if success and pid:
    store=get_store();timeline=get_timeline()
    for path in generated:
-    asset=store.add_asset(pid,"image",prompt,str(path),{"model_type":model_type})
+    asset=store.add_asset(pid,"image",prompt,str(path),{"model_type":model_type,"runtime":decision.to_dict()})
     timeline.add(pid,{"kind":"image","track":"video","path":str(path),"asset_id":asset["id"],"name":Path(str(path)).name,"start":timeline.get(pid).get("duration",0),"duration":5,"volume":1})
   job.update(status="cancelled" if cancelled else ("completed" if success else "failed"),progress=1 if success else job.get("progress",0),result=payload)
   if not success:job["error"]="; ".join(str(e) for e in getattr(result,"errors",())) or "WanGP не смог выполнить генерацию"
