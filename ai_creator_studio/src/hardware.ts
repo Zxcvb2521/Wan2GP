@@ -43,24 +43,11 @@ export function checkModelCompatibility(hw: HardwareInfo, req: ModelRequirement)
   const vram = hw.gpu.vram_gb;
   const ram = hw.ram_gb;
 
-  if (req.min_ram_gb && ram < req.min_ram_gb) {
-    reasons.push(`Нужно минимум ${req.min_ram_gb} ГБ ОЗУ, доступно ${ram} ГБ.`);
-  }
-
-  if (req.vendors?.length && hw.gpu.accelerator && !req.vendors.includes(hw.gpu.vendor)) {
-    reasons.push(`Модель рассчитана на: ${req.vendors.join(', ')}.`);
-  }
-
-  if (req.min_vram_gb && vram < req.min_vram_gb && !req.cpu_supported) {
-    reasons.push(`Нужно минимум ${req.min_vram_gb} ГБ видеопамяти, доступно ${vram} ГБ.`);
-  }
-
+  if (req.min_ram_gb && ram < req.min_ram_gb) reasons.push(`Нужно минимум ${req.min_ram_gb} ГБ ОЗУ, доступно ${ram} ГБ.`);
+  if (req.vendors?.length && hw.gpu.accelerator && !req.vendors.includes(hw.gpu.vendor)) reasons.push(`Модель рассчитана на: ${req.vendors.join(', ')}.`);
+  if (req.min_vram_gb && vram < req.min_vram_gb && !req.cpu_supported) reasons.push(`Нужно минимум ${req.min_vram_gb} ГБ видеопамяти, доступно ${vram} ГБ.`);
   if (reasons.length) return { compatible: false, level: 'unsupported', reasons };
-
-  if (req.recommended_vram_gb && vram < req.recommended_vram_gb) {
-    return { compatible: true, level: 'possible', reasons: [`Работа возможна, но рекомендуется ${req.recommended_vram_gb} ГБ VRAM.`] };
-  }
-
+  if (req.recommended_vram_gb && vram < req.recommended_vram_gb) return { compatible: true, level: 'possible', reasons: [`Работа возможна, но рекомендуется ${req.recommended_vram_gb} ГБ VRAM.`] };
   return { compatible: true, level: 'recommended', reasons: [] };
 }
 
