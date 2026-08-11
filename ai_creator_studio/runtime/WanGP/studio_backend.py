@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import parse_qs,urlparse
 ROOT=Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
-HOST="127.0.0.1";PORT=int(os.environ.get("AI_CREATOR_PORT","18765"));OUTPUT_DIR=(ROOT/"ai_creator_studio"/"projects"/"generated").resolve();DATA_DIR=(ROOT/"ai_creator_studio"/"projects"/"data").resolve();MODEL_DIR=(ROOT/"ai_creator_studio"/"models"/"installed").resolve();_session=None;_session_lock=threading.Lock();_jobs={};_render_jobs={}
+HOST="127.0.0.1";PORT=int(os.environ.get("AI_CREATOR_PORT","18765"));OUTPUT_DIR=(ROOT/"ai_creator_studio"/"projects"/"generated").resolve();DATA_DIR=(ROOT/"ai_creator_studio"/"projects"/"data").resolve();MODEL_DIR=(ROOT/"ai_creator_studio"/"models"/"installed").resolve();_session=None;_session_lock=threading.Lock();_jobs={};_render_jobs={};_model_jobs={}
 def get_session():
  global _session
  with _session_lock:
@@ -75,6 +75,13 @@ def run_render(job_id,project_id,timeline):
   job.update(status="rendering",progress=.02,phase="Подготовка")
   output=OUTPUT_DIR/project_id/f"{job_id}.mp4";result=render_timeline(timeline,output,ROOT);store=get_store();asset=store.add_asset(project_id,"video","Экспорт Timeline",str(result),{"duration":timeline.get("duration",0),"fps":timeline.get("fps",30)});job.update(status="completed",progress=1,phase="Готово",output=str(result),asset=asset)
  except Exception as exc:job.update(status="failed",progress=0,error=str(exc))
+def run_model_install(job_id,model_id,files):
+ job=_model_jobs[job_id]
+ def progress(info):
+  total=max(0,int(info.get("total_bytes",0)));done=max(0,int(info.get("bytes",0)));job.update(phase=info.get("phase",""),file=info.get("file","") or "",bytes=done,total_bytes=total,progress=(done/total if total else 0))
+ try:
+  job.update(status="installing",progress=0,phase="Подготовка");record=get_model_store().install_bundle(model_id,files,progress);job.update(status="completed",progress=1,phase="Готово",model=record)
+ except Exception as exc:job.update(status="failed",error=str(exc),phase="Ошибка")
 class Handler(BaseHTTPRequestHandler):
  def send_json(self,status,payload):
   data=json.dumps(payload,ensure_ascii=False).encode();self.send_response(status);self.send_header("Access-Control-Allow-Origin","*");self.send_header("Content-Type","application/json; charset=utf-8");self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
@@ -91,6 +98,8 @@ class Handler(BaseHTTPRequestHandler):
     self.send_json(200,detect_hardware())
    elif p.path=="/models":self.send_json(200,model_info())
    elif p.path=="/models/installed":self.send_json(200,{"ok":True,"models":get_model_store().list_installed()})
+   elif p.path.startswith("/model-jobs/"):
+    job=_model_jobs.get(p.path.rsplit("/",1)[-1]);self.send_json(200 if job else 404,job or {"error":"Установка не найдена"})
    elif p.path=="/projects":self.send_json(200,{"ok":True,"projects":get_store().list_projects()})
    elif p.path.startswith("/projects/") and p.path.endswith("/assets"):self.send_json(200,{"ok":True,"assets":get_store().list_assets(p.path.split("/")[2])})
    elif p.path.startswith("/projects/") and p.path.endswith("/timeline"):self.send_json(200,{"ok":True,"timeline":get_timeline().get(p.path.split("/")[2])})
@@ -106,9 +115,9 @@ class Handler(BaseHTTPRequestHandler):
    p=urlparse(self.path);body=self.read_json()
    if p.path=="/projects":project=get_store().create_project(str(body.get("name","Новый проект")));self.send_json(201,{"ok":True,"project":project});return
    if p.path=="/models/install":
-    model_id=str(body.get("model_id","")).strip();url=str(body.get("url","")).strip();filename=str(body.get("filename","")).strip();sha256=body.get("sha256")
-    if not all((model_id,url,filename)):self.send_json(400,{"ok":False,"error":"Нужны model_id, url и filename"});return
-    record=get_model_store().install_file(model_id,url,filename,sha256);self.send_json(201,{"ok":True,"model":record});return
+    model_id=str(body.get("model_id","")).strip();files=body.get("files") or []
+    if not model_id or not isinstance(files,list) or not files:self.send_json(400,{"ok":False,"error":"Нужны model_id и непустой список files"});return
+    jid=uuid.uuid4().hex;_model_jobs[jid]={"id":jid,"model_id":model_id,"status":"queued","progress":0,"phase":"Очередь","bytes":0,"total_bytes":sum(max(0,int(x.get("size_bytes",0))) for x in files)};threading.Thread(target=run_model_install,args=(jid,model_id,files),daemon=True).start();self.send_json(202,{"ok":True,"job_id":jid});return
    if p.path.startswith("/projects/") and p.path.endswith("/timeline/items"):
     pid=p.path.split("/")[2];self.send_json(201,{"ok":True,"timeline":get_timeline().add(pid,body)});return
    if p.path.startswith("/projects/") and p.path.endswith("/render"):
