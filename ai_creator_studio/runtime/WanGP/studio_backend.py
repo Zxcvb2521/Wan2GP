@@ -1,4 +1,4 @@
-"""Local backend bridge between AI Creator Studio and WanGP's public session API."""
+"""Local backend bridge between AI Creator Studio and WanGP's headless session API."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("AI_CREATOR_PORT", "18765"))
+OUTPUT_DIR = ROOT / "ai_creator_studio" / "projects" / "generated"
 
 _session = None
 _session_lock = threading.Lock()
@@ -27,8 +28,8 @@ def get_session():
     global _session
     with _session_lock:
         if _session is None:
-            from shared.api import WanGPSession
-            _session = WanGPSession()
+            from shared.api import init
+            _session = init(root=ROOT, output_dir=OUTPUT_DIR, console_output=False)
         return _session
 
 
@@ -51,55 +52,60 @@ def jsonable(value: Any) -> Any:
 def model_info() -> dict[str, Any]:
     session = get_session()
     try:
-        models = session.list_model_defs()
+        models = session.list_model_metadata(include_availability=True)
     except Exception as exc:
         return {"ok": False, "error": str(exc), "models": []}
     return {"ok": True, "models": jsonable(models)}
 
 
-def choose_image_model(models: Any) -> str | None:
-    """Pick only from discovered WanGP metadata; never invent a model id."""
-    if isinstance(models, dict):
-        items = models.items()
-    elif isinstance(models, list):
-        items = []
-        for item in models:
-            if isinstance(item, dict):
-                mid = item.get("id") or item.get("model_id") or item.get("name")
-                if mid:
-                    items.append((mid, item))
-    else:
-        return None
-
-    candidates: list[tuple[str, Any]] = []
-    for mid, meta in items:
-        text = json.dumps(jsonable(meta), ensure_ascii=False).lower()
-        if any(token in text for token in ("image", "img", "text-to-image", "t2i")):
-            candidates.append((str(mid), meta))
-    if not candidates and isinstance(models, dict):
-        candidates = [(str(k), v) for k, v in models.items()]
-    return candidates[0][0] if candidates else None
+def choose_image_model(models: list[dict[str, Any]]) -> str | None:
+    """Select a real model_type from WanGP metadata; never invent an id."""
+    candidates: list[dict[str, Any]] = []
+    for model in models:
+        model_type = str(model.get("model_type") or "").strip()
+        if not model_type:
+            continue
+        text = json.dumps(model, ensure_ascii=False).lower()
+        availability = model.get("availability") or {}
+        if availability.get("available") is False:
+            continue
+        if any(token in text for token in ("text-to-image", "text to image", "image generation", "image", "t2i")):
+            candidates.append(model)
+    return str(candidates[0]["model_type"]) if candidates else None
 
 
-def run_image(job_id: str, prompt: str, settings: dict[str, Any]) -> None:
+def run_image(job_id: str, prompt: str, overrides: dict[str, Any]) -> None:
     job = _jobs[job_id]
     try:
         session = get_session()
         job.update(status="preparing", progress=0.02)
-        model_id = settings.get("model_id")
-        if not model_id:
-            model_id = choose_image_model(session.list_model_defs())
-        if not model_id:
+        models = session.list_model_metadata(include_availability=True)
+        model_type = str(overrides.get("model_type") or choose_image_model(models) or "").strip()
+        if not model_type:
             raise RuntimeError("WanGP не сообщил доступную модель для генерации изображения")
 
-        job.update(status="running", progress=0.05, model_id=model_id)
-        task = session.submit_task(
-            model_id=model_id,
-            settings={**settings, "prompt": prompt},
-        )
-        result = session.run_task(task)
+        schema = session.get_model_schema(model_type)
+        if not schema:
+            raise RuntimeError(f"Не удалось получить схему модели: {model_type}")
+        settings = dict(schema.get("default_settings") or {})
+        settings.update({k: v for k, v in overrides.items() if k != "model_type"})
+        settings["model_type"] = model_type
+        settings["prompt"] = prompt
+        settings.setdefault("repeat_generation", 1)
+        settings.setdefault("batch_size", 1)
+
+        job.update(status="running", progress=0.05, model_type=model_type, model_name=schema.get("name"))
+        session_job = session.submit_task(settings)
+        result = session_job.result()
         payload = jsonable(result)
-        job.update(status="completed", progress=1.0, result=payload)
+        job.update(
+            status="completed" if getattr(result, "success", False) else "failed",
+            progress=1.0 if getattr(result, "success", False) else 0.0,
+            result=payload,
+        )
+        if not getattr(result, "success", False):
+            errors = getattr(result, "errors", ())
+            job["error"] = "; ".join(str(error) for error in errors) or "WanGP не смог выполнить генерацию"
     except Exception as exc:
         job.update(status="failed", progress=0.0, error=str(exc))
 
@@ -123,6 +129,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "engine": "WanGP", "stage": "session"})
             elif self.path == "/models":
                 self.send_json(200, model_info())
+            elif self.path.startswith("/models/") and self.path.endswith("/schema"):
+                model_type = self.path[len("/models/"):-len("/schema")]
+                self.send_json(200, jsonable(get_session().get_model_schema(model_type)))
             elif self.path.startswith("/jobs/"):
                 job_id = self.path.rsplit("/", 1)[-1]
                 job = _jobs.get(job_id)
@@ -155,4 +164,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
