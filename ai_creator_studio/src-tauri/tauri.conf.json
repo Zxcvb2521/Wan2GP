@@ -27,6 +27,6 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi"],
-    "resources": ["runtime"]
+    "resources": ["../runtime"]
   }
 }
