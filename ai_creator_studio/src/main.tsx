@@ -15,10 +15,7 @@ const actions = [
 
 async function waitForBackend() {
   for (let attempt = 0; attempt < 60; attempt += 1) {
-    try {
-      const response = await fetch(`${API}/health`);
-      if (response.ok) return true;
-    } catch { /* backend is still starting */ }
+    try { if ((await fetch(`${API}/health`)).ok) return true; } catch { /* starting */ }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   return false;
@@ -40,9 +37,7 @@ function App() {
         await invoke('start_engine');
         const ready = await waitForBackend();
         if (mounted) setEngineReady(ready);
-      } catch (err) {
-        if (mounted) setError(String(err));
-      }
+      } catch (err) { if (mounted) setError(String(err)); }
     })();
     return () => { mounted = false; };
   }, []);
@@ -58,8 +53,19 @@ function App() {
         body: JSON.stringify({ prompt }),
       });
       const data = await response.json();
-      if (!response.ok || data.success === false) throw new Error(data.error || data.errors?.join(', ') || 'Генерация завершилась с ошибкой');
-      setResult(data.files || data.artifacts?.map((item: { path?: string }) => item.path).filter(Boolean) || []);
+      if (!response.ok) throw new Error(data.error || 'Не удалось создать задачу');
+      const jobId = data.job_id as string;
+      let current: any = null;
+      for (let i = 0; i < 720; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const poll = await fetch(`${API}/jobs/${jobId}`);
+        current = await poll.json();
+        if (current.status === 'completed' || current.status === 'failed') break;
+      }
+      if (!current || current.status === 'failed') throw new Error(current?.error || 'Генерация завершилась с ошибкой');
+      const payload = current.result || {};
+      const files = payload.files || payload.artifacts?.map((item: { path?: string }) => item.path).filter(Boolean) || [];
+      setResult(files.length ? files : [JSON.stringify(payload)]);
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
     finally { setGenerating(false); }
   }
@@ -78,10 +84,8 @@ function App() {
           <div className="system-card"><div className="system-row"><Cpu size={15} /><span>RTX 5060 Ti</span><i className={engineReady ? 'online' : 'offline'} /></div><div className="system-row muted"><HardDrive size={15} /><span>24 ГБ памяти</span></div></div>
         </div>
       </aside>
-
       <main className="main">
         <header className="topbar"><div><span className="eyebrow">ЛОКАЛЬНАЯ AI-СТУДИЯ</span><h1>{active === 'home' ? 'Что создаём?' : active === 'projects' ? 'Мои проекты' : active === 'history' ? 'История генераций' : 'Настройки'}</h1></div><div className="status"><i className={engineReady ? 'online' : 'offline'} /> {engineReady ? 'Движок готов' : 'Запуск движка…'}</div></header>
-
         {active === 'home' && <section className="content">
           <div className="mode-grid">{actions.map(({ id, icon: Icon, title, text }) => <button key={id} className={mode === id ? 'mode-card selected' : 'mode-card'} onClick={() => setMode(id)}><div className="mode-icon"><Icon size={22} /></div><div><strong>{title}</strong><span>{text}</span></div><ChevronRight size={17} className="arrow" /></button>)}</div>
           <div className="creator-card">
@@ -91,8 +95,7 @@ function App() {
             {error && <div className="error-box">{error}</div>}
             {result.length > 0 && <div className="result-box"><strong>Готово</strong>{result.map((file) => <div key={file} className="result-file">{file}</div>)}</div>}
           </div>
-          <div className="section-title"><h3>Последние проекты</h3><button className="link">Показать все</button></div>
-          <div className="empty-state"><div className="empty-icon"><FolderOpen size={24} /></div><strong>Пока здесь пусто</strong><span>Создайте первый материал — он появится здесь.</span></div>
+          <div className="section-title"><h3>Последние проекты</h3><button className="link">Показать все</button></div><div className="empty-state"><div className="empty-icon"><FolderOpen size={24} /></div><strong>Пока здесь пусто</strong><span>Создайте первый материал — он появится здесь.</span></div>
         </section>}
         {active !== 'home' && <section className="placeholder"><div className="empty-icon"><Sparkles size={24} /></div><h2>Раздел готовится</h2><p>Основа приложения уже работает. Следующий этап — проекты, история и остальные генераторы.</p></section>}
       </main>
