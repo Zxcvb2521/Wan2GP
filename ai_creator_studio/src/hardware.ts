@@ -33,8 +33,8 @@ export interface ModelCompatibility {
 
 export function choosePerformanceProfile(hw: HardwareInfo): PerformanceProfile {
   if (!hw.gpu.accelerator || hw.gpu.vram_gb < 4) return 'cpu';
-  if (hw.gpu.vram_gb >= 20) return 'high';
-  if (hw.gpu.vram_gb >= 10) return 'balanced';
+  if (hw.gpu.vram_gb >= 20 && hw.ram_gb >= 32) return 'high';
+  if (hw.gpu.vram_gb >= 10 && hw.ram_gb >= 16) return 'balanced';
   return 'economy';
 }
 
@@ -55,25 +55,15 @@ export function checkModelCompatibility(hw: HardwareInfo, req: ModelRequirement)
     reasons.push(`Нужно минимум ${req.min_vram_gb} ГБ видеопамяти, доступно ${vram} ГБ.`);
   }
 
-  if (reasons.length) {
-    return { compatible: false, level: 'unsupported', reasons };
-  }
+  if (reasons.length) return { compatible: false, level: 'unsupported', reasons };
 
   if (req.recommended_vram_gb && vram < req.recommended_vram_gb) {
-    return {
-      compatible: true,
-      level: 'possible',
-      reasons: [`Работа возможна, но рекомендуется ${req.recommended_vram_gb} ГБ VRAM.`],
-    };
+    return { compatible: true, level: 'possible', reasons: [`Работа возможна, но рекомендуется ${req.recommended_vram_gb} ГБ VRAM.`] };
   }
 
   return { compatible: true, level: 'recommended', reasons: [] };
 }
 
-/**
- * Нормализует данные hardware detector backend перед передачей в UI.
- * Никакой конкретной модели GPU здесь не зашивается.
- */
 export function normalizeHardware(raw: Partial<HardwareInfo>): HardwareInfo {
   const hw: HardwareInfo = {
     platform: raw.platform || 'unknown',
@@ -90,7 +80,6 @@ export function normalizeHardware(raw: Partial<HardwareInfo>): HardwareInfo {
     },
     profile: 'cpu',
   };
-
   hw.profile = choosePerformanceProfile(hw);
   return hw;
 }
