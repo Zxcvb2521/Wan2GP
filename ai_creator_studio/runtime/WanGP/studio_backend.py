@@ -1,6 +1,6 @@
 """Local backend bridge between AI Creator Studio and WanGP's headless session API."""
 from __future__ import annotations
-import json,mimetypes,os,sys,threading,uuid,shutil
+import json,mimetypes,os,sys,threading,uuid
 from dataclasses import asdict,is_dataclass
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
@@ -60,16 +60,8 @@ def run_image(job_id,prompt,overrides):
  try:
   session=get_session();job.update(status="preparing",progress=.02);models=session.list_model_metadata(include_availability=True);model_type=str(overrides.get("model_type") or choose_image_model(models) or "").strip()
   if not model_type:raise RuntimeError("WanGP не сообщил доступную модель для генерации изображения")
-  schema=session.get_model_schema(model_type);settings=dict(schema.get("default_settings") or {})
-  user_settings={k:v for k,v in overrides.items() if k!="model_type"}
-  settings.update(user_settings)
-  policy=get_runtime_policy()
-  decision=policy.select(model=schema,overrides=user_settings)
-  settings.update(decision.settings)
-  settings.update(model_type=model_type,prompt=prompt)
-  settings.setdefault("repeat_generation",1);settings.setdefault("batch_size",1)
-  job.update(status="running",progress=.05,model_type=model_type,model_name=schema.get("name"),runtime=decision.to_dict())
-  sj=session.submit_task(settings);job["session_job"]=sj
+  schema=session.get_model_schema(model_type);settings=dict(schema.get("default_settings") or {});user_settings={k:v for k,v in overrides.items() if k!="model_type"};settings.update(user_settings);decision=get_runtime_policy().select(model=schema,overrides=user_settings);settings.update(decision.settings);settings.update(model_type=model_type,prompt=prompt);settings.setdefault("repeat_generation",1);settings.setdefault("batch_size",1)
+  job.update(status="running",progress=.05,model_type=model_type,model_name=schema.get("name"),runtime=decision.to_dict());sj=session.submit_task(settings);job["session_job"]=sj
   while not sj.done:
    event=sj.events.get(timeout=.25)
    if event is not None:event_update(job,event)
@@ -77,18 +69,45 @@ def run_image(job_id,prompt,overrides):
   if success and pid:
    store=get_store();timeline=get_timeline()
    for path in generated:
-    asset=store.add_asset(pid,"image",prompt,str(path),{"model_type":model_type,"runtime":decision.to_dict()})
-    timeline.add(pid,{"kind":"image","track":"video","path":str(path),"asset_id":asset["id"],"name":Path(str(path)).name,"start":timeline.get(pid).get("duration",0),"duration":5,"volume":1})
+    asset=store.add_asset(pid,"image",prompt,str(path),{"model_type":model_type,"runtime":decision.to_dict()});timeline.add(pid,{"kind":"image","track":"video","path":str(path),"asset_id":asset["id"],"name":Path(str(path)).name,"start":timeline.get(pid).get("duration",0),"duration":5,"volume":1})
   job.update(status="cancelled" if cancelled else ("completed" if success else "failed"),progress=1 if success else job.get("progress",0),result=payload)
   if not success:job["error"]="; ".join(str(e) for e in getattr(result,"errors",())) or "WanGP не смог выполнить генерацию"
+ except Exception as exc:job.update(status="failed",progress=0,error=str(exc))
+ finally:job.pop("session_job",None)
+def choose_video_model(models):
+ candidates=[]
+ for model in models:
+  mt=str(model.get("model_type") or "").strip()
+  if not mt or (model.get("availability") or {}).get("available") is False:continue
+  text=json.dumps(model,ensure_ascii=False).lower();score=0
+  if any(x in text for x in ("text-to-video","text to video","t2v")):score+=100
+  if any(x in text for x in ("video","wan","ltx")):score+=20
+  if score:candidates.append((score,mt))
+ candidates.sort(reverse=True);return candidates[0][1] if candidates else None
+def run_video(job_id,prompt,overrides):
+ job=_jobs[job_id]
+ try:
+  session=get_session();job.update(status="preparing",progress=.02);models=session.list_model_metadata(include_availability=True);model_type=str(overrides.get("model_type") or choose_video_model(models) or "").strip()
+  if not model_type:raise RuntimeError("WanGP не сообщил доступную модель для генерации видео")
+  schema=session.get_model_schema(model_type);user_settings={k:v for k,v in overrides.items() if k!="model_type"};settings=dict(schema.get("default_settings") or {});settings.update(user_settings);decision=get_runtime_policy().select(model=schema,overrides=user_settings);settings.update(decision.settings);settings.update(model_type=model_type,prompt=prompt);settings.setdefault("repeat_generation",1);settings.setdefault("batch_size",1)
+  job.update(status="running",progress=.05,model_type=model_type,model_name=schema.get("name"),runtime=decision.to_dict(),media_type="video");sj=session.submit_task(settings);job["session_job"]=sj
+  while not sj.done:
+   event=sj.events.get(timeout=.25)
+   if event is not None:event_update(job,event)
+  result=sj.result();payload=jsonable(result);success=bool(getattr(result,"success",False));cancelled=bool(getattr(result,"cancelled",False));generated=payload.get("generated_files",[]) if isinstance(payload,dict) else [];pid=job.get("project_id")
+  if success and pid:
+   store=get_store();timeline=get_timeline()
+   for path in generated:
+    asset=store.add_asset(pid,"video",prompt,str(path),{"model_type":model_type,"runtime":decision.to_dict()});timeline.add(pid,{"kind":"video","track":"video","path":str(path),"asset_id":asset["id"],"name":Path(str(path)).name,"start":timeline.get(pid).get("duration",0),"duration":5,"volume":1})
+  job.update(status="cancelled" if cancelled else ("completed" if success else "failed"),progress=1 if success else job.get("progress",0),result=payload)
+  if not success:job["error"]="; ".join(str(e) for e in getattr(result,"errors",())) or "WanGP не смог выполнить генерацию видео"
  except Exception as exc:job.update(status="failed",progress=0,error=str(exc))
  finally:job.pop("session_job",None)
 def run_render(job_id,project_id,timeline):
  job=_render_jobs[job_id]
  try:
   from studio_render import render_timeline
-  job.update(status="rendering",progress=.02,phase="Подготовка")
-  output=OUTPUT_DIR/project_id/f"{job_id}.mp4";result=render_timeline(timeline,output,ROOT);store=get_store();asset=store.add_asset(project_id,"video","Экспорт Timeline",str(result),{"duration":timeline.get("duration",0),"fps":timeline.get("fps",30)});job.update(status="completed",progress=1,phase="Готово",output=str(result),asset=asset)
+  job.update(status="rendering",progress=.02,phase="Подготовка");output=OUTPUT_DIR/project_id/f"{job_id}.mp4";result=render_timeline(timeline,output,ROOT);store=get_store();asset=store.add_asset(project_id,"video","Экспорт Timeline",str(result),{"duration":timeline.get("duration",0),"fps":timeline.get("fps",30)});job.update(status="completed",progress=1,phase="Готово",output=str(result),asset=asset)
  except Exception as exc:job.update(status="failed",progress=0,error=str(exc))
 def run_model_install(job_id,model_id,files):
  job=_model_jobs[job_id]
@@ -138,10 +157,10 @@ class Handler(BaseHTTPRequestHandler):
     pid=p.path.split("/")[2];self.send_json(201,{"ok":True,"timeline":get_timeline().add(pid,body)});return
    if p.path.startswith("/projects/") and p.path.endswith("/render"):
     pid=p.path.split("/")[2];timeline=get_timeline().get(pid);jid=uuid.uuid4().hex;_render_jobs[jid]={"id":jid,"status":"queued","progress":0,"phase":"","project_id":pid};threading.Thread(target=run_render,args=(jid,pid,timeline),daemon=True).start();self.send_json(202,{"ok":True,"job_id":jid});return
-   if p.path=="/generate/image":
+   if p.path in ("/generate/image","/generate/video"):
     prompt=str(body.get("prompt","")).strip()
-    if not prompt:self.send_json(400,{"ok":False,"error":"Введите описание изображения"});return
-    jid=uuid.uuid4().hex;_jobs[jid]={"id":jid,"status":"queued","progress":0.0,"phase":"","project_id":body.get("project_id")};threading.Thread(target=run_image,args=(jid,prompt,body.get("settings") or {}),daemon=True).start();self.send_json(202,{"ok":True,"job_id":jid});return
+    if not prompt:self.send_json(400,{"ok":False,"error":"Введите описание"});return
+    media_type="video" if p.path.endswith("video") else "image";jid=uuid.uuid4().hex;_jobs[jid]={"id":jid,"status":"queued","progress":0.0,"phase":"","project_id":body.get("project_id"),"media_type":media_type};runner=run_video if media_type=="video" else run_image;threading.Thread(target=runner,args=(jid,prompt,body.get("settings") or {}),daemon=True).start();self.send_json(202,{"ok":True,"job_id":jid});return
    if p.path.startswith("/jobs/") and p.path.endswith("/cancel"):
     job=_jobs.get(p.path.split("/")[2]);sj=job.get("session_job") if job else None
     if not job:self.send_json(404,{"ok":False,"error":"Задача не найдена"});return
