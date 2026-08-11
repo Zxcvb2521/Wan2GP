@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import parse_qs,urlparse
 ROOT=Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
-HOST="127.0.0.1";PORT=int(os.environ.get("AI_CREATOR_PORT","18765"));OUTPUT_DIR=(ROOT/"ai_creator_studio"/"projects"/"generated").resolve();DATA_DIR=(ROOT/"ai_creator_studio"/"projects"/"data").resolve();_session=None;_session_lock=threading.Lock();_jobs={}
+HOST="127.0.0.1";PORT=int(os.environ.get("AI_CREATOR_PORT","18765"));OUTPUT_DIR=(ROOT/"ai_creator_studio"/"projects"/"generated").resolve();DATA_DIR=(ROOT/"ai_creator_studio"/"projects"/"data").resolve();_session=None;_session_lock=threading.Lock();_jobs={};_render_jobs={}
 def get_session():
  global _session
  with _session_lock:
@@ -67,6 +67,17 @@ def safe_output_file(value):
  if path!=OUTPUT_DIR and OUTPUT_DIR not in path.parents:raise ValueError("Файл находится вне каталога результатов")
  if not path.is_file():raise FileNotFoundError(path)
  return path
+def run_render(job_id,project_id,timeline):
+ job=_render_jobs[job_id]
+ try:
+  from studio_render import render_timeline
+  job.update(status="rendering",progress=.02,phase="Подготовка")
+  output=OUTPUT_DIR/project_id/f"{job_id}.mp4"
+  def update(progress,phase):job.update(progress=float(progress),phase=phase)
+  result=render_timeline(timeline,output,ROOT)
+  store=get_store();asset=store.add_asset(project_id,"video","Экспорт Timeline",str(result),{"duration":timeline.get("duration",0),"fps":timeline.get("fps",30)})
+  job.update(status="completed",progress=1,phase="Готово",output=str(result),asset=asset)
+ except Exception as exc:job.update(status="failed",progress=0,error=str(exc))
 class Handler(BaseHTTPRequestHandler):
  def send_json(self,status,payload):
   data=json.dumps(payload,ensure_ascii=False).encode();self.send_response(status);self.send_header("Access-Control-Allow-Origin","*");self.send_header("Content-Type","application/json; charset=utf-8");self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
@@ -83,10 +94,11 @@ class Handler(BaseHTTPRequestHandler):
    elif p.path=="/projects":self.send_json(200,{"ok":True,"projects":get_store().list_projects()})
    elif p.path.startswith("/projects/") and p.path.endswith("/assets"):self.send_json(200,{"ok":True,"assets":get_store().list_assets(p.path.split("/")[2])})
    elif p.path.startswith("/projects/") and p.path.endswith("/timeline"):self.send_json(200,{"ok":True,"timeline":get_timeline().get(p.path.split("/")[2])})
-   elif p.path=="/file":
-    path=safe_output_file(parse_qs(p.query).get("path",[""])[0]);data=path.read_bytes();self.send_response(200);self.send_header("Access-Control-Allow-Origin","*");self.send_header("Content-Type",mimetypes.guess_type(path.name)[0] or "application/octet-stream");self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
+   elif p.path=="/file":path=safe_output_file(parse_qs(p.query).get("path",[""])[0]);data=path.read_bytes();self.send_response(200);self.send_header("Access-Control-Allow-Origin","*");self.send_header("Content-Type",mimetypes.guess_type(path.name)[0] or "application/octet-stream");self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
    elif p.path.startswith("/jobs/"):
     job=_jobs.get(p.path.rsplit("/",1)[-1]);self.send_json(200 if job else 404,{k:v for k,v in job.items() if k!="session_job"} if job else {"error":"Задача не найдена"})
+   elif p.path.startswith("/renders/"):
+    job=_render_jobs.get(p.path.rsplit("/",1)[-1]);self.send_json(200 if job else 404,job or {"error":"Рендер не найден"})
    else:self.send_json(404,{"ok":False,"error":"Не найдено"})
   except Exception as exc:self.send_json(500,{"ok":False,"error":str(exc)})
  def do_POST(self):
@@ -95,6 +107,8 @@ class Handler(BaseHTTPRequestHandler):
    if p.path=="/projects":project=get_store().create_project(str(body.get("name","Новый проект")));self.send_json(201,{"ok":True,"project":project});return
    if p.path.startswith("/projects/") and p.path.endswith("/timeline/items"):
     pid=p.path.split("/")[2];self.send_json(201,{"ok":True,"timeline":get_timeline().add(pid,body)});return
+   if p.path.startswith("/projects/") and p.path.endswith("/render"):
+    pid=p.path.split("/")[2];timeline=get_timeline().get(pid);jid=uuid.uuid4().hex;_render_jobs[jid]={"id":jid,"status":"queued","progress":0,"phase":"","project_id":pid};threading.Thread(target=run_render,args=(jid,pid,timeline),daemon=True).start();self.send_json(202,{"ok":True,"job_id":jid});return
    if p.path=="/generate/image":
     prompt=str(body.get("prompt","")).strip()
     if not prompt:self.send_json(400,{"ok":False,"error":"Введите описание изображения"});return
