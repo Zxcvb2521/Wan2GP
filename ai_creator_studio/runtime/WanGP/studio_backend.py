@@ -73,7 +73,6 @@ def run_render(job_id,project_id,timeline):
   from studio_render import render_timeline
   job.update(status="rendering",progress=.02,phase="Подготовка")
   output=OUTPUT_DIR/project_id/f"{job_id}.mp4"
-  def update(progress,phase):job.update(progress=float(progress),phase=phase)
   result=render_timeline(timeline,output,ROOT)
   store=get_store();asset=store.add_asset(project_id,"video","Экспорт Timeline",str(result),{"duration":timeline.get("duration",0),"fps":timeline.get("fps",30)})
   job.update(status="completed",progress=1,phase="Готово",output=str(result),asset=asset)
@@ -84,13 +83,13 @@ class Handler(BaseHTTPRequestHandler):
  def read_json(self):
   n=int(self.headers.get("Content-Length","0"));return json.loads(self.rfile.read(n) or b"{}")
  def do_OPTIONS(self):
-  self.send_response(204);self.send_header("Access-Control-Allow-Origin","*");self.send_header("Access-Control-Allow-Headers","Content-Type");self.send_header("Access-Control-Allow-Methods","GET,POST,PUT,OPTIONS");self.end_headers()
+  self.send_response(204);self.send_header("Access-Control-Allow-Origin","*");self.send_header("Access-Control-Allow-Headers","Content-Type");self.send_header("Access-Control-Allow-Methods","GET,POST,PUT,DELETE,OPTIONS");self.end_headers()
  def do_GET(self):
   try:
    p=urlparse(self.path)
    if p.path=="/health":self.send_json(200,{"ok":True,"engine":"WanGP","stage":"session"})
    elif p.path=="/models":self.send_json(200,model_info())
-   elif p.path.startswith("/models/") and p.path.endswith("/schema"):self.send_json(200,jsonable(get_session().get_model_schema(p.path[len("/models/"):-len("/schema")])))
+   elif p.path.startswith("/models/") and p.path.endswith("/schema"):self.send_json(200,jsonable(get_session().get_model_schema(p.path[len("/models/"):-len("/schema") ])))
    elif p.path=="/projects":self.send_json(200,{"ok":True,"projects":get_store().list_projects()})
    elif p.path.startswith("/projects/") and p.path.endswith("/assets"):self.send_json(200,{"ok":True,"assets":get_store().list_assets(p.path.split("/")[2])})
    elif p.path.startswith("/projects/") and p.path.endswith("/timeline"):self.send_json(200,{"ok":True,"timeline":get_timeline().get(p.path.split("/")[2])})
@@ -123,9 +122,23 @@ class Handler(BaseHTTPRequestHandler):
  def do_PUT(self):
   try:
    p=urlparse(self.path);body=self.read_json()
-   if p.path.startswith("/projects/") and p.path.endswith("/timeline"):
-    pid=p.path.split("/")[2];self.send_json(200,{"ok":True,"timeline":get_timeline().save(pid,body)});return
+   parts=[x for x in p.path.split("/") if x]
+   if len(parts)==4 and parts[0]=="projects" and parts[2]=="timeline" and parts[3]=="items":
+    self.send_json(400,{"ok":False,"error":"Не указан ID клипа"});return
+   if len(parts)==5 and parts[0]=="projects" and parts[2]=="timeline" and parts[3]=="items":
+    self.send_json(200,{"ok":True,"timeline":get_timeline().update_item(parts[1],parts[4],body)});return
+   if len(parts)==3 and parts[0]=="projects" and parts[2]=="timeline":
+    self.send_json(200,{"ok":True,"timeline":get_timeline().save(parts[1],body)});return
    self.send_json(404,{"ok":False,"error":"Не найдено"})
+  except KeyError as exc:self.send_json(404,{"ok":False,"error":str(exc)})
+  except Exception as exc:self.send_json(500,{"ok":False,"error":str(exc)})
+ def do_DELETE(self):
+  try:
+   p=urlparse(self.path);parts=[x for x in p.path.split("/") if x]
+   if len(parts)==5 and parts[0]=="projects" and parts[2]=="timeline" and parts[3]=="items":
+    self.send_json(200,{"ok":True,"timeline":get_timeline().delete_item(parts[1],parts[4])});return
+   self.send_json(404,{"ok":False,"error":"Не найдено"})
+  except KeyError as exc:self.send_json(404,{"ok":False,"error":str(exc)})
   except Exception as exc:self.send_json(500,{"ok":False,"error":str(exc)})
  def log_message(self,*_args):return
 if __name__=="__main__":OUTPUT_DIR.mkdir(parents=True,exist_ok=True);DATA_DIR.mkdir(parents=True,exist_ok=True);ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
