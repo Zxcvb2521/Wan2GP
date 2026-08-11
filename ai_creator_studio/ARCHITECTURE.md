@@ -14,6 +14,7 @@ Windows-first desktop-приложение поверх существующег
 6. Frontend и backend отделены от конкретного движка через adapters.
 7. GPU/RAM/VRAM состояние показывается пользователю понятно, без необходимости знать внутренности PyTorch.
 8. Все тяжёлые операции выполняются как управляемые jobs с прогрессом, отменой и восстановлением.
+9. Studio не дублирует возможности WanGP без необходимости: Deepy остаётся нативным агентом WanGP и подключается через adapter.
 
 ## Предлагаемый стек
 
@@ -23,9 +24,18 @@ Windows-first desktop-приложение поверх существующег
 - Desktop/backend bridge: Tauri commands + локальный HTTP/WebSocket только внутри приложения при необходимости
 - Orchestrator: Python/FastAPI или нативный Rust orchestration layer; первый MVP допускает отдельный локальный Python orchestrator
 - AI engine: WanGP
-- Optional LLM engine: KoboldCpp, подключаемый позже
+- Native media agent: Deepy внутри WanGP
+- Optional external LLM engine: Ollama / KoboldCpp, подключаемые позже для сценариев, текста и альтернативного LLM runtime
 - Media: FFmpeg
 - Storage: SQLite + файловое хранилище проекта
+
+## Роли Deepy и внешних LLM
+
+Deepy не заменяется Ollama или KoboldCpp. Deepy — нативный WanGP-агент для многошаговой работы с медиа: он может оркестрировать генерацию/обработку изображений, видео и аудио и использовать контекст уже созданных материалов.
+
+В Studio Deepy должен использоваться как существующая capability WanGP, а не как отдельная самостоятельно переписанная система. На текущем этапе adapter только обнаруживает нативный Deepy и его требования; прямые image/video jobs продолжают использовать существующий headless/session API WanGP.
+
+Ollama и KoboldCpp — отдельные внешние LLM-провайдеры. Они не обязательны для базового MVP и не должны вытеснять Deepy. Их будущая роль — сценарии, длинный текст, идеи, структурирование проекта и другие задачи общего LLM.
 
 ## Runtime layout
 
@@ -65,6 +75,15 @@ EngineAdapter
 ├── generate_audio()
 ├── generate_voice()
 └── transcribe_audio()
+```
+
+Deepy имеет отдельную границу интеграции:
+
+```text
+DeepyAdapter
+├── detect_availability()
+├── detect_required_prompt_enhancer()
+└── launch_native_cli()
 ```
 
 Фактические функции и точки интеграции нельзя угадывать: перед реализацией adapter необходимо исследовать исходники WanGP и существующие Deepy/controller/headless возможности.
