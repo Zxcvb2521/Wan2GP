@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-12",
+  "models": [
+    {
+      "id": "wan2gp-image",
+      "version": "catalog",
+      "kind": "image",
+      "display_name": "Wan — изображения",
+      "description": "Метаданные модели. Точные файлы подключаются после проверки официального источника.",
+      "requirements": {
+        "min_vram_gb": 6,
+        "recommended_vram_gb": 12,
+        "min_ram_gb": 16,
+        "cpu_supported": false,
+        "vendors": ["nvidia"]
+      },
+      "files": [],
+      "sources": []
+    },
+    {
+      "id": "wan2gp-video",
+      "version": "catalog",
+      "kind": "video",
+      "display_name": "Wan — видео",
+      "description": "Метаданные модели. Точные файлы подключаются после проверки официального источника.",
+      "requirements": {
+        "min_vram_gb": 8,
+        "recommended_vram_gb": 16,
+        "min_ram_gb": 24,
+        "cpu_supported": false,
+        "vendors": ["nvidia"]
+      },
+      "files": [],
+      "sources": []
+    },
+    {
+      "id": "local-llm",
+      "version": "catalog",
+      "kind": "llm",
+      "display_name": "Локальная LLM",
+      "description": "Текстовые модели для сценариев, промптов и помощника проекта.",
+      "requirements": { "min_ram_gb": 8, "cpu_supported": true },
+      "files": [],
+      "sources": []
+    },
+    {
+      "id": "local-tts",
+      "version": "catalog",
+      "kind": "tts",
+      "display_name": "Локальный TTS",
+      "description": "Синтез речи для озвучивания проекта.",
+      "requirements": { "min_ram_gb": 8, "cpu_supported": true },
+      "files": [],
+      "sources": []
+    },
+    {
+      "id": "local-music",
+      "version": "catalog",
+      "kind": "music",
+      "display_name": "Локальная музыка",
+      "description": "Генерация музыкального сопровождения.",
+      "requirements": { "min_ram_gb": 16, "cpu_supported": true },
+      "files": [],
+      "sources": []
+    }
+  ]
+}
