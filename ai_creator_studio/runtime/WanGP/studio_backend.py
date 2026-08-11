@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import sys
 import threading
@@ -10,6 +11,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
@@ -17,7 +19,7 @@ if str(ROOT) not in sys.path:
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("AI_CREATOR_PORT", "18765"))
-OUTPUT_DIR = ROOT / "ai_creator_studio" / "projects" / "generated"
+OUTPUT_DIR = (ROOT / "ai_creator_studio" / "projects" / "generated").resolve()
 
 _session = None
 _session_lock = threading.Lock()
@@ -59,16 +61,15 @@ def model_info() -> dict[str, Any]:
 
 
 def choose_image_model(models: list[dict[str, Any]]) -> str | None:
-    """Select a real model_type from WanGP metadata; never invent an id."""
     candidates: list[dict[str, Any]] = []
     for model in models:
         model_type = str(model.get("model_type") or "").strip()
         if not model_type:
             continue
-        text = json.dumps(model, ensure_ascii=False).lower()
         availability = model.get("availability") or {}
         if availability.get("available") is False:
             continue
+        text = json.dumps(model, ensure_ascii=False).lower()
         if any(token in text for token in ("text-to-image", "text to image", "image generation", "image", "t2i")):
             candidates.append(model)
     return str(candidates[0]["model_type"]) if candidates else None
@@ -83,7 +84,6 @@ def run_image(job_id: str, prompt: str, overrides: dict[str, Any]) -> None:
         model_type = str(overrides.get("model_type") or choose_image_model(models) or "").strip()
         if not model_type:
             raise RuntimeError("WanGP не сообщил доступную модель для генерации изображения")
-
         schema = session.get_model_schema(model_type)
         if not schema:
             raise RuntimeError(f"Не удалось получить схему модели: {model_type}")
@@ -93,27 +93,33 @@ def run_image(job_id: str, prompt: str, overrides: dict[str, Any]) -> None:
         settings["prompt"] = prompt
         settings.setdefault("repeat_generation", 1)
         settings.setdefault("batch_size", 1)
-
         job.update(status="running", progress=0.05, model_type=model_type, model_name=schema.get("name"))
         session_job = session.submit_task(settings)
         result = session_job.result()
         payload = jsonable(result)
-        job.update(
-            status="completed" if getattr(result, "success", False) else "failed",
-            progress=1.0 if getattr(result, "success", False) else 0.0,
-            result=payload,
-        )
-        if not getattr(result, "success", False):
+        success = bool(getattr(result, "success", False))
+        job.update(status="completed" if success else "failed", progress=1.0 if success else 0.0, result=payload)
+        if not success:
             errors = getattr(result, "errors", ())
             job["error"] = "; ".join(str(error) for error in errors) or "WanGP не смог выполнить генерацию"
     except Exception as exc:
         job.update(status="failed", progress=0.0, error=str(exc))
 
 
+def safe_output_file(value: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if path != OUTPUT_DIR and OUTPUT_DIR not in path.parents:
+        raise ValueError("Файл находится вне каталога результатов AI Creator Studio")
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -123,17 +129,35 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(length) or b"{}")
 
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.end_headers()
+
     def do_GET(self) -> None:
         try:
-            if self.path == "/health":
+            parsed = urlparse(self.path)
+            if parsed.path == "/health":
                 self.send_json(200, {"ok": True, "engine": "WanGP", "stage": "session"})
-            elif self.path == "/models":
+            elif parsed.path == "/models":
                 self.send_json(200, model_info())
-            elif self.path.startswith("/models/") and self.path.endswith("/schema"):
-                model_type = self.path[len("/models/"):-len("/schema")]
+            elif parsed.path.startswith("/models/") and parsed.path.endswith("/schema"):
+                model_type = parsed.path[len("/models/"):-len("/schema")]
                 self.send_json(200, jsonable(get_session().get_model_schema(model_type)))
-            elif self.path.startswith("/jobs/"):
-                job_id = self.path.rsplit("/", 1)[-1]
+            elif parsed.path == "/file":
+                raw = parse_qs(parsed.query).get("path", [""])[0]
+                path = safe_output_file(raw)
+                data = path.read_bytes()
+                self.send_response(200)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            elif parsed.path.startswith("/jobs/"):
+                job_id = parsed.path.rsplit("/", 1)[-1]
                 job = _jobs.get(job_id)
                 self.send_json(200 if job else 404, job or {"error": "Задача не найдена"})
             else:
