@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import uuid
+from dataclasses import asdict, is_dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,8 @@ def jsonable(value: Any) -> Any:
         return value
     if isinstance(value, Path):
         return str(value)
+    if is_dataclass(value):
+        return jsonable(asdict(value))
     if isinstance(value, dict):
         return {str(k): jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -75,6 +78,33 @@ def choose_image_model(models: list[dict[str, Any]]) -> str | None:
     return str(candidates[0]["model_type"]) if candidates else None
 
 
+def event_update(job: dict[str, Any], event: Any) -> None:
+    """Translate WanGP SessionEvent/ProgressUpdate into a tiny UI-safe status object."""
+    kind = str(getattr(event, "kind", "") or "")
+    data = getattr(event, "data", None)
+    data_name = data.__class__.__name__ if data is not None else ""
+
+    if data_name == "ProgressUpdate":
+        progress = int(getattr(data, "progress", 0) or 0)
+        job.update(
+            progress=max(0, min(100, progress)) / 100,
+            phase=str(getattr(data, "phase", "") or ""),
+            status=str(getattr(data, "status", "") or ""),
+            current_step=getattr(data, "current_step", None),
+            total_steps=getattr(data, "total_steps", None),
+        )
+    elif data_name == "PreviewUpdate":
+        job["phase"] = str(getattr(data, "phase", "") or job.get("phase", ""))
+        job["status_text"] = str(getattr(data, "status", "") or job.get("status_text", ""))
+        job["preview_available"] = getattr(data, "image", None) is not None
+    elif kind == "stream":
+        text = str(getattr(data, "text", data) or "").strip()
+        if text:
+            job["log"] = (job.get("log", []) + [text])[-30:]
+    elif kind in {"error", "failed"}:
+        job["error"] = str(data or "WanGP сообщила об ошибке")
+
+
 def run_image(job_id: str, prompt: str, overrides: dict[str, Any]) -> None:
     job = _jobs[job_id]
     try:
@@ -94,16 +124,33 @@ def run_image(job_id: str, prompt: str, overrides: dict[str, Any]) -> None:
         settings.setdefault("repeat_generation", 1)
         settings.setdefault("batch_size", 1)
         job.update(status="running", progress=0.05, model_type=model_type, model_name=schema.get("name"))
+
+        # submit_task() creates the actual SessionJob. We keep that object so
+        # progress events and cancellation remain connected to the same run.
         session_job = session.submit_task(settings)
+        job["session_job"] = session_job
+
+        while not session_job.done:
+            event = session_job.events.get(timeout=0.25)
+            if event is not None:
+                event_update(job, event)
+
         result = session_job.result()
         payload = jsonable(result)
         success = bool(getattr(result, "success", False))
-        job.update(status="completed" if success else "failed", progress=1.0 if success else 0.0, result=payload)
+        cancelled = bool(getattr(result, "cancelled", False))
+        job.update(
+            status="cancelled" if cancelled else ("completed" if success else "failed"),
+            progress=1.0 if success else job.get("progress", 0.0),
+            result=payload,
+        )
         if not success:
             errors = getattr(result, "errors", ())
             job["error"] = "; ".join(str(error) for error in errors) or "WanGP не смог выполнить генерацию"
     except Exception as exc:
         job.update(status="failed", progress=0.0, error=str(exc))
+    finally:
+        job.pop("session_job", None)
 
 
 def safe_output_file(value: str) -> Path:
@@ -159,7 +206,11 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/jobs/"):
                 job_id = parsed.path.rsplit("/", 1)[-1]
                 job = _jobs.get(job_id)
-                self.send_json(200 if job else 404, job or {"error": "Задача не найдена"})
+                if job:
+                    response = {k: v for k, v in job.items() if k != "session_job"}
+                    self.send_json(200, response)
+                else:
+                    self.send_json(404, {"error": "Задача не найдена"})
             else:
                 self.send_json(404, {"ok": False, "error": "Не найдено"})
         except Exception as exc:
@@ -167,19 +218,36 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
-            if self.path != "/generate/image":
-                self.send_json(404, {"ok": False, "error": "Не найдено"})
+            parsed = urlparse(self.path)
+            if parsed.path == "/generate/image":
+                body = self.read_json()
+                prompt = str(body.get("prompt", "")).strip()
+                if not prompt:
+                    self.send_json(400, {"ok": False, "error": "Введите описание изображения"})
+                    return
+                job_id = uuid.uuid4().hex
+                _jobs[job_id] = {"id": job_id, "status": "queued", "progress": 0.0, "phase": ""}
+                thread = threading.Thread(target=run_image, args=(job_id, prompt, body.get("settings") or {}), daemon=True)
+                thread.start()
+                self.send_json(202, {"ok": True, "job_id": job_id})
                 return
-            body = self.read_json()
-            prompt = str(body.get("prompt", "")).strip()
-            if not prompt:
-                self.send_json(400, {"ok": False, "error": "Введите описание изображения"})
+
+            if parsed.path.startswith("/jobs/") and parsed.path.endswith("/cancel"):
+                job_id = parsed.path.split("/")[2]
+                job = _jobs.get(job_id)
+                if not job:
+                    self.send_json(404, {"ok": False, "error": "Задача не найдена"})
+                    return
+                session_job = job.get("session_job")
+                if session_job is not None:
+                    session_job.cancel()
+                    job.update(status="cancelling")
+                    self.send_json(202, {"ok": True, "status": "cancelling"})
+                else:
+                    self.send_json(409, {"ok": False, "error": "Генерация ещё не запустилась"})
                 return
-            job_id = uuid.uuid4().hex
-            _jobs[job_id] = {"id": job_id, "status": "queued", "progress": 0.0}
-            thread = threading.Thread(target=run_image, args=(job_id, prompt, body.get("settings") or {}), daemon=True)
-            thread.start()
-            self.send_json(202, {"ok": True, "job_id": job_id})
+
+            self.send_json(404, {"ok": False, "error": "Не найдено"})
         except Exception as exc:
             self.send_json(500, {"ok": False, "error": str(exc)})
 
