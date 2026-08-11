@@ -60,6 +60,10 @@ AI Creator Studio
 - [x] Три базовые дорожки Timeline: видео, голос, музыка.
 - [x] Добавление результата генерации в Timeline.
 - [x] Компактный UI Timeline внутри приложения.
+- [x] Локальный FFmpeg renderer для Timeline.
+- [x] API фонового экспорта проекта в MP4.
+- [x] Отображение прогресса экспорта в UI.
+- [x] Сохранение экспортированного MP4 как Asset проекта.
 
 ## Текущая архитектура
 
@@ -72,7 +76,9 @@ ai_creator_studio/
 ├── runtime/
 │   └── WanGP/
 │       ├── studio_backend.py
-│       └── studio_timeline.py
+│       ├── studio_projects.py
+│       ├── studio_timeline.py
+│       └── studio_render.py
 │
 └── projects/
     ├── generated/
@@ -90,13 +96,43 @@ ai_creator_studio/
 - `/projects/{id}/assets`
 - `/projects/{id}/timeline`
 - `/projects/{id}/timeline/items`
+- `/projects/{id}/render`
 - `/generate/image`
 - `/jobs/{id}`
 - `/jobs/{id}/cancel`
+- `/renders/{id}`
+
+### `studio_projects.py`
+
+SQLite-хранилище проектов и Assets. Результаты генерации и итоговый MP4 записываются в проект, поэтому проект постепенно становится самостоятельным контейнером созданного контента.
 
 ### `studio_timeline.py`
 
-Легковесное persistent-хранилище Timeline. На текущем этапе используется JSON внутри локального каталога проекта. Архитектура специально отделена от UI, чтобы позднее заменить хранилище на SQLite/единую project database без переписывания Timeline-компонента.
+Легковесное persistent-хранилище Timeline. Timeline хранится отдельно от React UI и содержит проект, FPS, длительность и клипы. Позднее его можно объединить с общей project database без изменения пользовательской модели.
+
+### `studio_render.py`
+
+Минимальный локальный FFmpeg renderer. На текущем этапе он умеет собрать последовательность изображений/видео и смешать дорожки голоса/музыки в MP4. Это сознательно небольшой первый слой: эффекты, переходы и сложный монтаж будут добавляться поверх существующего формата Timeline.
+
+## Экспорт
+
+Пользователь выбирает проект → открывает Timeline → нажимает **«Экспорт MP4»**.
+
+```text
+Project Timeline
+      ↓
+POST /projects/{id}/render
+      ↓
+background render job
+      ↓
+FFmpeg
+      ↓
+projects/generated/{project_id}/...
+      ↓
+Asset проекта
+```
+
+Экспорт выполняется в фоне, поэтому интерфейс не должен зависать во время рендера.
 
 ## План ближайшей разработки
 
@@ -112,22 +148,16 @@ ai_creator_studio/
 - нормальная временная шкала;
 - сохранение всех изменений.
 
-### Этап 2 — Media Engine
+### Этап 2 — Media Engine 2.0
 
-Создать локальный FFmpeg-слой, который сможет читать Timeline и собирать настоящий результат:
-
-```text
-Timeline
-   ↓
-FFmpeg graph
-   ├── video
-   ├── voice
-   ├── music
-   ├── image
-   └── audio mixing
-   ↓
-MP4 / WebM / WAV / MP3
-```
+- корректная временная позиция каждого клипа;
+- переходы;
+- fade in/out;
+- громкость;
+- mute/solo;
+- несколько аудиодорожек;
+- выбор формата экспорта;
+- открытие готового файла из приложения.
 
 ### Этап 3 — Голос и музыка
 
