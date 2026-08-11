@@ -91,6 +91,9 @@ class Handler(BaseHTTPRequestHandler):
   try:
    p=urlparse(self.path)
    if p.path=="/health":self.send_json(200,{"ok":True,"engine":"WanGP","stage":"session"})
+   elif p.path=="/hardware":
+    from studio_hardware import detect_hardware
+    self.send_json(200,detect_hardware())
    elif p.path=="/models":self.send_json(200,model_info())
    elif p.path.startswith("/models/") and p.path.endswith("/schema"):self.send_json(200,jsonable(get_session().get_model_schema(p.path[len("/models/"):-len("/schema") ])))
    elif p.path=="/projects":self.send_json(200,{"ok":True,"projects":get_store().list_projects()})
