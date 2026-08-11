@@ -5,7 +5,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.request import Request, urlopen
 
 
@@ -22,7 +22,7 @@ class ModelStore:
 
     def _read_registry(self) -> dict[str, Any]:
         if not self.registry_path.exists():
-            return {"version": 1, "models": {}}
+            return {"version": 2, "models": {}}
         try:
             return json.loads(self.registry_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -44,51 +44,87 @@ class ModelStore:
         return path if path.exists() else None
 
     @staticmethod
-    def _sha256(path: Path) -> str:
+    def _sha256(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
         digest = hashlib.sha256()
         with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            for chunk in iter(lambda: stream.read(chunk_size), b""):
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def install_file(self, model_id: str, url: str, filename: str, sha256: str | None = None) -> dict[str, Any]:
-        if not url.startswith(("https://", "http://")):
-            raise ModelStoreError("Источник модели должен использовать HTTP(S).")
-        destination_dir = self.models_dir / model_id
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        destination = destination_dir / filename
+    def install_bundle(
+        self,
+        model_id: str,
+        files: list[dict[str, Any]],
+        progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        if not model_id or not files:
+            raise ModelStoreError("Пакет модели не содержит файлов.")
+        destination = self.models_dir / model_id
+        staging_root = Path(tempfile.mkdtemp(prefix=f"{model_id}-", dir=self.models_dir))
+        records: list[dict[str, Any]] = []
+        total = sum(max(0, int(item.get("size_bytes", 0))) for item in files)
+        completed = 0
 
-        with tempfile.NamedTemporaryFile(prefix="model-", suffix=".download", delete=False, dir=destination_dir) as tmp:
-            temp_path = Path(tmp.name)
+        def report(phase: str, current: str = "") -> None:
+            if progress:
+                progress({"phase": phase, "file": current, "bytes": completed, "total_bytes": total})
 
         try:
-            request = Request(url, headers={"User-Agent": "AI-Creator-Studio/0.1"})
-            with urlopen(request, timeout=60) as response, temp_path.open("wb") as output:
-                shutil.copyfileobj(response, output, length=1024 * 1024)
+            for item in files:
+                filename = str(item.get("filename", "")).replace("\\", "/").lstrip("/")
+                url = str(item.get("url", ""))
+                expected = str(item.get("sha256", "")).strip().lower()
+                if not filename or Path(filename).is_absolute() or ".." in Path(filename).parts:
+                    raise ModelStoreError(f"Некорректное имя файла: {filename}")
+                if not url.startswith(("https://", "http://")):
+                    raise ModelStoreError(f"Некорректный источник для {filename}")
 
-            actual_hash = self._sha256(temp_path)
-            if sha256 and actual_hash.lower() != sha256.lower():
-                raise ModelStoreError("Проверка SHA-256 не пройдена.")
+                target = staging_root / filename
+                target.parent.mkdir(parents=True, exist_ok=True)
+                report("downloading", filename)
+                request = Request(url, headers={"User-Agent": "AI-Creator-Studio/0.1"})
+                with urlopen(request, timeout=60) as response, target.open("wb") as output:
+                    while True:
+                        chunk = response.read(4 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        completed += len(chunk)
+                        if progress:
+                            progress({"phase": "downloading", "file": filename, "bytes": completed, "total_bytes": total})
 
-            temp_path.replace(destination)
+                report("verifying", filename)
+                actual = self._sha256(target)
+                if expected and actual != expected:
+                    raise ModelStoreError(f"SHA-256 не совпадает: {filename}")
+                records.append({"filename": filename, "path": str(destination / filename), "sha256": actual, "size_bytes": target.stat().st_size})
+
+            report("installing")
+            if destination.exists():
+                shutil.rmtree(destination)
+            staging_root.replace(destination)
             registry = self._read_registry()
+            registry["version"] = 2
             registry["models"][model_id] = {
                 "model_id": model_id,
                 "path": str(destination),
-                "filename": filename,
-                "sha256": actual_hash,
+                "files": records,
                 "verified": True,
             }
             self._write_registry(registry)
+            report("completed")
             return registry["models"][model_id]
-        finally:
-            if temp_path.exists():
-                temp_path.unlink(missing_ok=True)
+        except Exception:
+            shutil.rmtree(staging_root, ignore_errors=True)
+            raise
+
+    def install_file(self, model_id: str, url: str, filename: str, sha256: str | None = None) -> dict[str, Any]:
+        return self.install_bundle(model_id, [{"url": url, "filename": filename, "sha256": sha256 or ""}])
 
     def remove(self, model_id: str) -> None:
         registry = self._read_registry()
         record = registry.get("models", {}).pop(model_id, None)
         if record:
             path = Path(record.get("path", ""))
-            shutil.rmtree(path.parent, ignore_errors=True)
+            shutil.rmtree(path, ignore_errors=True)
             self._write_registry(registry)
