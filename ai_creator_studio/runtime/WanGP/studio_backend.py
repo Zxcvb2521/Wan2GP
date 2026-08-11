@@ -57,7 +57,10 @@ def run_image(job_id,prompt,overrides):
    if event is not None:event_update(job,event)
   result=sj.result();payload=jsonable(result);success=bool(getattr(result,"success",False));cancelled=bool(getattr(result,"cancelled",False));generated=payload.get("generated_files",[]) if isinstance(payload,dict) else [];pid=job.get("project_id")
   if success and pid:
-   for path in generated:get_store().add_asset(pid,"image",prompt,str(path),{"model_type":model_type})
+   store=get_store();timeline=get_timeline()
+   for path in generated:
+    asset=store.add_asset(pid,"image",prompt,str(path),{"model_type":model_type})
+    timeline.add(pid,{"kind":"image","track":"video","path":str(path),"asset_id":asset["id"],"name":Path(str(path)).name,"start":timeline.get(pid).get("duration",0),"duration":5,"volume":1})
   job.update(status="cancelled" if cancelled else ("completed" if success else "failed"),progress=1 if success else job.get("progress",0),result=payload)
   if not success:job["error"]="; ".join(str(e) for e in getattr(result,"errors",())) or "WanGP не смог выполнить генерацию"
  except Exception as exc:job.update(status="failed",progress=0,error=str(exc))
