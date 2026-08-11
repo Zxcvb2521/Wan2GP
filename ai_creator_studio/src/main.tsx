@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Image, Video, Music, Mic2, BookOpen, FolderOpen, History, Settings, Sparkles, Cpu, HardDrive, ChevronRight } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { Image, Video, Music, Mic2, BookOpen, FolderOpen, History, Settings, Sparkles, Cpu, HardDrive, ChevronRight, LoaderCircle } from 'lucide-react';
 import './styles.css';
 
+const API = 'http://127.0.0.1:18765';
 const actions = [
   { id: 'video', icon: Video, title: 'Видео', text: 'Создать видео по описанию' },
   { id: 'image', icon: Image, title: 'Изображение', text: 'Создать картинку' },
@@ -11,72 +13,88 @@ const actions = [
   { id: 'story', icon: BookOpen, title: 'История', text: 'Создать сценарий и проект' },
 ];
 
+async function waitForBackend() {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      const response = await fetch(`${API}/health`);
+      if (response.ok) return true;
+    } catch { /* backend is still starting */ }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
+}
+
 function App() {
   const [active, setActive] = useState('home');
   const [prompt, setPrompt] = useState('');
   const [mode, setMode] = useState('image');
+  const [engineReady, setEngineReady] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState<string[]>([]);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        await invoke('start_engine');
+        const ready = await waitForBackend();
+        if (mounted) setEngineReady(ready);
+      } catch (err) {
+        if (mounted) setError(String(err));
+      }
+    })();
+    return () => { mounted = false; };
+  }, []);
 
   const selected = actions.find((item) => item.id === mode) ?? actions[1];
+
+  async function generate() {
+    if (!prompt.trim() || generating || mode !== 'image') return;
+    setGenerating(true); setError(''); setResult([]);
+    try {
+      const response = await fetch(`${API}/generate/image`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt }),
+      });
+      const data = await response.json();
+      if (!response.ok || data.success === false) throw new Error(data.error || data.errors?.join(', ') || 'Генерация завершилась с ошибкой');
+      setResult(data.files || data.artifacts?.map((item: { path?: string }) => item.path).filter(Boolean) || []);
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setGenerating(false); }
+  }
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark"><Sparkles size={19} /></div>
-          <div><strong>AI Creator</strong><span>Studio</span></div>
-        </div>
-
+        <div className="brand"><div className="brand-mark"><Sparkles size={19} /></div><div><strong>AI Creator</strong><span>Studio</span></div></div>
         <nav>
           <button className={active === 'home' ? 'nav-item active' : 'nav-item'} onClick={() => setActive('home')}><Sparkles size={18} /> Создать</button>
           <button className={active === 'projects' ? 'nav-item active' : 'nav-item'} onClick={() => setActive('projects')}><FolderOpen size={18} /> Проекты</button>
           <button className={active === 'history' ? 'nav-item active' : 'nav-item'} onClick={() => setActive('history')}><History size={18} /> История</button>
         </nav>
-
         <div className="sidebar-bottom">
           <button className="nav-item" onClick={() => setActive('settings')}><Settings size={18} /> Настройки</button>
-          <div className="system-card">
-            <div className="system-row"><Cpu size={15} /><span>RTX 5060 Ti</span><i className="online" /></div>
-            <div className="system-row muted"><HardDrive size={15} /><span>Память 24 ГБ</span></div>
-          </div>
+          <div className="system-card"><div className="system-row"><Cpu size={15} /><span>RTX 5060 Ti</span><i className={engineReady ? 'online' : 'offline'} /></div><div className="system-row muted"><HardDrive size={15} /><span>24 ГБ памяти</span></div></div>
         </div>
       </aside>
 
       <main className="main">
-        <header className="topbar">
-          <div><span className="eyebrow">ЛОКАЛЬНАЯ AI-СТУДИЯ</span><h1>{active === 'home' ? 'Что создаём?' : active === 'projects' ? 'Мои проекты' : active === 'history' ? 'История генераций' : 'Настройки'}</h1></div>
-          <div className="status"><i className="online" /> Движок готов</div>
-        </header>
+        <header className="topbar"><div><span className="eyebrow">ЛОКАЛЬНАЯ AI-СТУДИЯ</span><h1>{active === 'home' ? 'Что создаём?' : active === 'projects' ? 'Мои проекты' : active === 'history' ? 'История генераций' : 'Настройки'}</h1></div><div className="status"><i className={engineReady ? 'online' : 'offline'} /> {engineReady ? 'Движок готов' : 'Запуск движка…'}</div></header>
 
-        {active === 'home' && (
-          <section className="content">
-            <div className="mode-grid">
-              {actions.map(({ id, icon: Icon, title, text }) => (
-                <button key={id} className={mode === id ? 'mode-card selected' : 'mode-card'} onClick={() => setMode(id)}>
-                  <div className="mode-icon"><Icon size={22} /></div>
-                  <div><strong>{title}</strong><span>{text}</span></div>
-                  <ChevronRight size={17} className="arrow" />
-                </button>
-              ))}
-            </div>
-
-            <div className="creator-card">
-              <div className="creator-head">
-                <div><span className="eyebrow">{selected.title.toUpperCase()}</span><h2>{selected.text}</h2></div>
-                <button className="ghost">Расширенные настройки</button>
-              </div>
-              <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Опишите, что вы хотите создать…" />
-              <div className="creator-footer">
-                <span className="hint">Генерация выполняется локально на вашем компьютере</span>
-                <button className="generate" disabled={!prompt.trim()}><Sparkles size={18} /> Создать</button>
-              </div>
-            </div>
-
-            <div className="section-title"><h3>Последние проекты</h3><button className="link">Показать все</button></div>
-            <div className="empty-state"><div className="empty-icon"><FolderOpen size={24} /></div><strong>Пока здесь пусто</strong><span>Создайте первый материал — он появится здесь.</span></div>
-          </section>
-        )}
-
-        {active !== 'home' && <section className="placeholder"><div className="empty-icon"><Sparkles size={24} /></div><h2>Раздел готовится</h2><p>Это окно уже подключено к новой оболочке. Следующим этапом сюда подключается реальный backend WanGP.</p></section>}
+        {active === 'home' && <section className="content">
+          <div className="mode-grid">{actions.map(({ id, icon: Icon, title, text }) => <button key={id} className={mode === id ? 'mode-card selected' : 'mode-card'} onClick={() => setMode(id)}><div className="mode-icon"><Icon size={22} /></div><div><strong>{title}</strong><span>{text}</span></div><ChevronRight size={17} className="arrow" /></button>)}</div>
+          <div className="creator-card">
+            <div className="creator-head"><div><span className="eyebrow">{selected.title.toUpperCase()}</span><h2>{selected.text}</h2></div><button className="ghost">Расширенные настройки</button></div>
+            <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Опишите, что вы хотите создать…" />
+            <div className="creator-footer"><span className="hint">Генерация выполняется локально на вашем компьютере</span><button className="generate" disabled={!prompt.trim() || generating || !engineReady || mode !== 'image'} onClick={generate}>{generating ? <><LoaderCircle size={18} className="spin" /> Генерация…</> : <><Sparkles size={18} /> Создать</>}</button></div>
+            {error && <div className="error-box">{error}</div>}
+            {result.length > 0 && <div className="result-box"><strong>Готово</strong>{result.map((file) => <div key={file} className="result-file">{file}</div>)}</div>}
+          </div>
+          <div className="section-title"><h3>Последние проекты</h3><button className="link">Показать все</button></div>
+          <div className="empty-state"><div className="empty-icon"><FolderOpen size={24} /></div><strong>Пока здесь пусто</strong><span>Создайте первый материал — он появится здесь.</span></div>
+        </section>}
+        {active !== 'home' && <section className="placeholder"><div className="empty-icon"><Sparkles size={24} /></div><h2>Раздел готовится</h2><p>Основа приложения уже работает. Следующий этап — проекты, история и остальные генераторы.</p></section>}
       </main>
     </div>
   );
