@@ -1,136 +1,154 @@
-"""Local AI Creator Studio bridge for the real WanGP in-process API."""
+"""Local backend bridge between AI Creator Studio and WanGP's public session API."""
 
 from __future__ import annotations
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
+import sys
 import threading
-import traceback
-from urllib.parse import urlparse
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
-from shared.api import init
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("AI_CREATOR_PORT", "18765"))
-ROOT = Path(__file__).resolve().parent
-OUTPUT_DIR = ROOT / "studio_outputs"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 _session = None
-_session_lock = threading.RLock()
+_session_lock = threading.Lock()
+_jobs: dict[str, dict[str, Any]] = {}
 
 
 def get_session():
     global _session
     with _session_lock:
         if _session is None:
-            _session = init(
-                root=ROOT,
-                output_dir=OUTPUT_DIR,
-                console_output=False,
-            )
+            from shared.api import WanGPSession
+            _session = WanGPSession()
         return _session
 
 
-def json_safe(value):
-    if isinstance(value, dict):
-        return {str(k): json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [json_safe(v) for v in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
+def jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    if hasattr(value, "model_dump"):
+        return jsonable(value.model_dump())
+    if hasattr(value, "__dict__"):
+        return jsonable(value.__dict__)
     return str(value)
 
 
-def find_image_model(session):
-    records = session.list_model_metadata()
-    candidates = []
-    for record in records:
-        blob = json.dumps(record, ensure_ascii=False).lower()
-        model_type = str(record.get("model_type", ""))
-        if "image" in blob and "video" not in blob:
-            candidates.append(model_type)
-    if not candidates:
-        # The API is still useful without guessing: callers can use /models
-        # and submit an explicit model_type later.
-        return None
-    return candidates[0]
-
-
-def generate_image(prompt: str, model_type: str | None = None):
+def model_info() -> dict[str, Any]:
     session = get_session()
-    selected_model = model_type or find_image_model(session)
-    if not selected_model:
-        raise RuntimeError("Не удалось автоматически выбрать модель изображений. Используйте /models для выбора модели.")
+    try:
+        models = session.list_model_defs()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "models": []}
+    return {"ok": True, "models": jsonable(models)}
 
-    settings = session.get_default_settings(selected_model)
-    settings["model_type"] = selected_model
-    settings["prompt"] = prompt
-    settings["_api"] = {"return_media": True}
 
-    result = session.run_task(settings)
-    return {
-        "success": result.success,
-        "files": result.generated_files,
-        "errors": [str(error) for error in result.errors],
-        "model_type": selected_model,
-        "artifacts": [
-            {
-                "path": artifact.path,
-                "media_type": artifact.media_type,
-                "fps": artifact.fps,
-            }
-            for artifact in result.artifacts
-        ],
-    }
+def choose_image_model(models: Any) -> str | None:
+    """Pick only from discovered WanGP metadata; never invent a model id."""
+    if isinstance(models, dict):
+        items = models.items()
+    elif isinstance(models, list):
+        items = []
+        for item in models:
+            if isinstance(item, dict):
+                mid = item.get("id") or item.get("model_id") or item.get("name")
+                if mid:
+                    items.append((mid, item))
+    else:
+        return None
+
+    candidates: list[tuple[str, Any]] = []
+    for mid, meta in items:
+        text = json.dumps(jsonable(meta), ensure_ascii=False).lower()
+        if any(token in text for token in ("image", "img", "text-to-image", "t2i")):
+            candidates.append((str(mid), meta))
+    if not candidates and isinstance(models, dict):
+        candidates = [(str(k), v) for k, v in models.items()]
+    return candidates[0][0] if candidates else None
+
+
+def run_image(job_id: str, prompt: str, settings: dict[str, Any]) -> None:
+    job = _jobs[job_id]
+    try:
+        session = get_session()
+        job.update(status="preparing", progress=0.02)
+        model_id = settings.get("model_id")
+        if not model_id:
+            model_id = choose_image_model(session.list_model_defs())
+        if not model_id:
+            raise RuntimeError("WanGP не сообщил доступную модель для генерации изображения")
+
+        job.update(status="running", progress=0.05, model_id=model_id)
+        task = session.submit_task(
+            model_id=model_id,
+            settings={**settings, "prompt": prompt},
+        )
+        result = session.run_task(task)
+        payload = jsonable(result)
+        job.update(status="completed", progress=1.0, result=payload)
+    except Exception as exc:
+        job.update(status="failed", progress=0.0, error=str(exc))
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, status: int, payload: dict) -> None:
+    def send_json(self, status: int, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(data)
 
-    def do_OPTIONS(self) -> None:
-        self._send(204, {})
+    def read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(length) or b"{}")
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
         try:
-            if path == "/health":
-                self._send(200, {"ok": True, "engine": "WanGP", "stage": "ready"})
-                return
-            if path == "/models":
-                session = get_session()
-                self._send(200, {"ok": True, "models": json_safe(session.list_model_metadata())})
-                return
-            self._send(404, {"ok": False, "error": "Не найдено"})
+            if self.path == "/health":
+                self.send_json(200, {"ok": True, "engine": "WanGP", "stage": "session"})
+            elif self.path == "/models":
+                self.send_json(200, model_info())
+            elif self.path.startswith("/jobs/"):
+                job_id = self.path.rsplit("/", 1)[-1]
+                job = _jobs.get(job_id)
+                self.send_json(200 if job else 404, job or {"error": "Задача не найдена"})
+            else:
+                self.send_json(404, {"ok": False, "error": "Не найдено"})
         except Exception as exc:
-            self._send(500, {"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
+            self.send_json(500, {"ok": False, "error": str(exc)})
 
     def do_POST(self) -> None:
-        path = urlparse(self.path).path
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length) or b"{}")
-            if path == "/generate/image":
-                prompt = str(payload.get("prompt", "")).strip()
-                if not prompt:
-                    self._send(400, {"ok": False, "error": "Введите описание изображения."})
-                    return
-                result = generate_image(prompt, payload.get("model_type"))
-                self._send(200, result)
+            if self.path != "/generate/image":
+                self.send_json(404, {"ok": False, "error": "Не найдено"})
                 return
-            self._send(404, {"ok": False, "error": "Не найдено"})
+            body = self.read_json()
+            prompt = str(body.get("prompt", "")).strip()
+            if not prompt:
+                self.send_json(400, {"ok": False, "error": "Введите описание изображения"})
+                return
+            job_id = uuid.uuid4().hex
+            _jobs[job_id] = {"id": job_id, "status": "queued", "progress": 0.0}
+            thread = threading.Thread(target=run_image, args=(job_id, prompt, body.get("settings") or {}), daemon=True)
+            thread.start()
+            self.send_json(202, {"ok": True, "job_id": job_id})
         except Exception as exc:
-            self._send(500, {"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
+            self.send_json(500, {"ok": False, "error": str(exc)})
 
     def log_message(self, *_args) -> None:
         return
