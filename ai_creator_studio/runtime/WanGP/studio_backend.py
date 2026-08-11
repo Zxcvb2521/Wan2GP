@@ -1,6 +1,6 @@
 """Local backend bridge between AI Creator Studio and WanGP's headless session API."""
 from __future__ import annotations
-import json,mimetypes,os,sys,threading,uuid
+import json,mimetypes,os,sys,threading,uuid,shutil
 from dataclasses import asdict,is_dataclass
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import parse_qs,urlparse
 ROOT=Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
-HOST="127.0.0.1";PORT=int(os.environ.get("AI_CREATOR_PORT","18765"));OUTPUT_DIR=(ROOT/"ai_creator_studio"/"projects"/"generated").resolve();DATA_DIR=(ROOT/"ai_creator_studio"/"projects"/"data").resolve();_session=None;_session_lock=threading.Lock();_jobs={};_render_jobs={}
+HOST="127.0.0.1";PORT=int(os.environ.get("AI_CREATOR_PORT","18765"));OUTPUT_DIR=(ROOT/"ai_creator_studio"/"projects"/"generated").resolve();DATA_DIR=(ROOT/"ai_creator_studio"/"projects"/"data").resolve();MODEL_DIR=(ROOT/"ai_creator_studio"/"models"/"installed").resolve();_session=None;_session_lock=threading.Lock();_jobs={};_render_jobs={}
 def get_session():
  global _session
  with _session_lock:
@@ -22,6 +22,9 @@ def get_store():
 def get_timeline():
  from studio_timeline import TimelineStore
  return TimelineStore(DATA_DIR)
+def get_model_store():
+ from studio_model_store import ModelStore
+ return ModelStore(MODEL_DIR)
 def jsonable(value:Any)->Any:
  if value is None or isinstance(value,(str,int,float,bool)): return value
  if isinstance(value,Path): return str(value)
@@ -32,8 +35,8 @@ def jsonable(value:Any)->Any:
  if hasattr(value,"__dict__"): return jsonable(value.__dict__)
  return str(value)
 def model_info():
- try:return {"ok":True,"models":jsonable(get_session().list_model_metadata(include_availability=True))}
- except Exception as exc:return {"ok":False,"error":str(exc),"models":[]}
+ try:return {"ok":True,"models":jsonable(get_session().list_model_metadata(include_availability=True)),"installed":get_model_store().list_installed()}
+ except Exception as exc:return {"ok":False,"error":str(exc),"models":[],"installed":[]}
 def choose_image_model(models):
  for model in models:
   mt=str(model.get("model_type") or "").strip()
@@ -65,20 +68,12 @@ def run_image(job_id,prompt,overrides):
   if not success:job["error"]="; ".join(str(e) for e in getattr(result,"errors",())) or "WanGP не смог выполнить генерацию"
  except Exception as exc:job.update(status="failed",progress=0,error=str(exc))
  finally:job.pop("session_job",None)
-def safe_output_file(value):
- path=Path(value).expanduser().resolve()
- if path!=OUTPUT_DIR and OUTPUT_DIR not in path.parents:raise ValueError("Файл находится вне каталога результатов")
- if not path.is_file():raise FileNotFoundError(path)
- return path
 def run_render(job_id,project_id,timeline):
  job=_render_jobs[job_id]
  try:
   from studio_render import render_timeline
   job.update(status="rendering",progress=.02,phase="Подготовка")
-  output=OUTPUT_DIR/project_id/f"{job_id}.mp4"
-  result=render_timeline(timeline,output,ROOT)
-  store=get_store();asset=store.add_asset(project_id,"video","Экспорт Timeline",str(result),{"duration":timeline.get("duration",0),"fps":timeline.get("fps",30)})
-  job.update(status="completed",progress=1,phase="Готово",output=str(result),asset=asset)
+  output=OUTPUT_DIR/project_id/f"{job_id}.mp4";result=render_timeline(timeline,output,ROOT);store=get_store();asset=store.add_asset(project_id,"video","Экспорт Timeline",str(result),{"duration":timeline.get("duration",0),"fps":timeline.get("fps",30)});job.update(status="completed",progress=1,phase="Готово",output=str(result),asset=asset)
  except Exception as exc:job.update(status="failed",progress=0,error=str(exc))
 class Handler(BaseHTTPRequestHandler):
  def send_json(self,status,payload):
@@ -95,7 +90,7 @@ class Handler(BaseHTTPRequestHandler):
     from studio_hardware import detect_hardware
     self.send_json(200,detect_hardware())
    elif p.path=="/models":self.send_json(200,model_info())
-   elif p.path.startswith("/models/") and p.path.endswith("/schema"):self.send_json(200,jsonable(get_session().get_model_schema(p.path[len("/models/"):-len("/schema") ])))
+   elif p.path=="/models/installed":self.send_json(200,{"ok":True,"models":get_model_store().list_installed()})
    elif p.path=="/projects":self.send_json(200,{"ok":True,"projects":get_store().list_projects()})
    elif p.path.startswith("/projects/") and p.path.endswith("/assets"):self.send_json(200,{"ok":True,"assets":get_store().list_assets(p.path.split("/")[2])})
    elif p.path.startswith("/projects/") and p.path.endswith("/timeline"):self.send_json(200,{"ok":True,"timeline":get_timeline().get(p.path.split("/")[2])})
@@ -110,6 +105,10 @@ class Handler(BaseHTTPRequestHandler):
   try:
    p=urlparse(self.path);body=self.read_json()
    if p.path=="/projects":project=get_store().create_project(str(body.get("name","Новый проект")));self.send_json(201,{"ok":True,"project":project});return
+   if p.path=="/models/install":
+    model_id=str(body.get("model_id","")).strip();url=str(body.get("url","")).strip();filename=str(body.get("filename","")).strip();sha256=body.get("sha256")
+    if not all((model_id,url,filename)):self.send_json(400,{"ok":False,"error":"Нужны model_id, url и filename"});return
+    record=get_model_store().install_file(model_id,url,filename,sha256);self.send_json(201,{"ok":True,"model":record});return
    if p.path.startswith("/projects/") and p.path.endswith("/timeline/items"):
     pid=p.path.split("/")[2];self.send_json(201,{"ok":True,"timeline":get_timeline().add(pid,body)});return
    if p.path.startswith("/projects/") and p.path.endswith("/render"):
@@ -127,24 +126,24 @@ class Handler(BaseHTTPRequestHandler):
   except Exception as exc:self.send_json(500,{"ok":False,"error":str(exc)})
  def do_PUT(self):
   try:
-   p=urlparse(self.path);body=self.read_json()
-   parts=[x for x in p.path.split("/") if x]
-   if len(parts)==4 and parts[0]=="projects" and parts[2]=="timeline" and parts[3]=="items":
-    self.send_json(400,{"ok":False,"error":"Не указан ID клипа"});return
-   if len(parts)==5 and parts[0]=="projects" and parts[2]=="timeline" and parts[3]=="items":
-    self.send_json(200,{"ok":True,"timeline":get_timeline().update_item(parts[1],parts[4],body)});return
-   if len(parts)==3 and parts[0]=="projects" and parts[2]=="timeline":
-    self.send_json(200,{"ok":True,"timeline":get_timeline().save(parts[1],body)});return
+   p=urlparse(self.path);body=self.read_json();parts=[x for x in p.path.split("/") if x]
+   if len(parts)==5 and parts[0]=="projects" and parts[2]=="timeline" and parts[3]=="items":self.send_json(200,{"ok":True,"timeline":get_timeline().update_item(parts[1],parts[4],body)});return
+   if len(parts)==3 and parts[0]=="projects" and parts[2]=="timeline":self.send_json(200,{"ok":True,"timeline":get_timeline().save(parts[1],body)});return
    self.send_json(404,{"ok":False,"error":"Не найдено"})
   except KeyError as exc:self.send_json(404,{"ok":False,"error":str(exc)})
   except Exception as exc:self.send_json(500,{"ok":False,"error":str(exc)})
  def do_DELETE(self):
   try:
    p=urlparse(self.path);parts=[x for x in p.path.split("/") if x]
-   if len(parts)==5 and parts[0]=="projects" and parts[2]=="timeline" and parts[3]=="items":
-    self.send_json(200,{"ok":True,"timeline":get_timeline().delete_item(parts[1],parts[4])});return
+   if len(parts)==5 and parts[0]=="projects" and parts[2]=="timeline" and parts[3]=="items":self.send_json(200,{"ok":True,"timeline":get_timeline().delete_item(parts[1],parts[4])});return
+   if len(parts)==2 and parts[0]=="models":get_model_store().remove(parts[1]);self.send_json(200,{"ok":True});return
    self.send_json(404,{"ok":False,"error":"Не найдено"})
   except KeyError as exc:self.send_json(404,{"ok":False,"error":str(exc)})
   except Exception as exc:self.send_json(500,{"ok":False,"error":str(exc)})
  def log_message(self,*_args):return
-if __name__=="__main__":OUTPUT_DIR.mkdir(parents=True,exist_ok=True);DATA_DIR.mkdir(parents=True,exist_ok=True);ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+def safe_output_file(value):
+ path=Path(value).expanduser().resolve()
+ if path!=OUTPUT_DIR and OUTPUT_DIR not in path.parents:raise ValueError("Файл находится вне каталога результатов")
+ if not path.is_file():raise FileNotFoundError(path)
+ return path
+if __name__=="__main__":OUTPUT_DIR.mkdir(parents=True,exist_ok=True);DATA_DIR.mkdir(parents=True,exist_ok=True);MODEL_DIR.mkdir(parents=True,exist_ok=True);ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
