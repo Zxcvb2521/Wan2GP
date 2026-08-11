@@ -28,6 +28,9 @@ def get_model_store():
 def get_runtime_policy():
  from studio_runtime_policy import RuntimePolicy
  return RuntimePolicy()
+def get_deepy():
+ from studio_deepy import detect_deepy
+ return detect_deepy(ROOT)
 def jsonable(value:Any)->Any:
  if value is None or isinstance(value,(str,int,float,bool)): return value
  if isinstance(value,Path): return str(value)
@@ -108,6 +111,7 @@ class Handler(BaseHTTPRequestHandler):
    elif p.path=="/hardware":
     from studio_hardware import detect_hardware
     self.send_json(200,detect_hardware())
+   elif p.path=="/deepy":self.send_json(200,{"ok":True,"deepy":get_deepy()})
    elif p.path=="/models":self.send_json(200,model_info())
    elif p.path=="/models/installed":self.send_json(200,{"ok":True,"models":get_model_store().list_installed()})
    elif p.path.startswith("/model-jobs/"):
