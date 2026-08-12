@@ -24,7 +24,7 @@ fn runtime_root(app: &AppHandle) -> Result<PathBuf, String> {
         resource_dir.parent().unwrap_or(&resource_dir).parent().unwrap_or(&resource_dir).join("runtime"),
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join("ai_creator_studio").join("runtime"),
     ];
-    candidates.into_iter().find(|path| path.join("WanGP").exists()).ok_or_else(|| {
+    candidates.iter().find(|path| path.join("WanGP").exists()).cloned().ok_or_else(|| {
         format!("Встроенный runtime WanGP не найден. Проверены: {}", candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("; "))
     })
 }
@@ -43,14 +43,12 @@ fn engine_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(packaged_engine)
 }
 
-fn python_command(app: &AppHandle, runtime: &PathBuf) -> Result<Command, String> {
+fn python_command(runtime: &PathBuf) -> Command {
     let packaged = if cfg!(windows) { runtime.join("python").join("python.exe") } else { runtime.join("python").join("bin").join("python3") };
     if packaged.exists() {
-        return Ok(Command::new(packaged));
+        return Command::new(packaged);
     }
-    let mut command = if cfg!(windows) { Command::new("python") } else { Command::new("python3") };
-    let _ = app;
-    Ok(command)
+    if cfg!(windows) { Command::new("python") } else { Command::new("python3") }
 }
 
 #[tauri::command]
@@ -75,8 +73,7 @@ pub fn start_engine(app: AppHandle, state: State<'_, RuntimeState>) -> Result<St
     let mut guard = state.child.lock().map_err(|_| "Не удалось получить состояние движка")?;
     if guard.is_some() { return Ok("Движок уже запущен".into()); }
 
-    let mut command = python_command(&app, &runtime)?;
-    let child = command.arg(&entry)
+    let child = python_command(&runtime).arg(&entry)
         .current_dir(&engine)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
