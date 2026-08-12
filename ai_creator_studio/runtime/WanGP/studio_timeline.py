@@ -1,6 +1,6 @@
 """Persistent lightweight timeline for AI Creator Studio projects."""
 from __future__ import annotations
-import json, threading, uuid
+import json, shutil, subprocess, threading, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +16,18 @@ class TimelineStore:
     @staticmethod
     def _duration(items):
         return max((float(x.get("start",0))+float(x.get("duration",0)) for x in items),default=0)
+    @staticmethod
+    def _media_duration(path):
+        if not path: return None
+        try:
+            media=Path(str(path))
+            if not media.exists() or media.suffix.lower() not in {".mp4",".mov",".mkv",".webm",".avi",".m4v"}: return None
+            ffprobe=shutil.which("ffprobe")
+            if not ffprobe: return None
+            result=subprocess.run([ffprobe,"-v","error","-show_entries","format=duration","-of","default=noprint_wrappers=1:nokey=1",str(media)],capture_output=True,text=True,timeout=10,check=False)
+            value=float(result.stdout.strip()) if result.returncode==0 and result.stdout.strip() else 0
+            return value if value>0 else None
+        except (OSError,ValueError,subprocess.SubprocessError): return None
     def get(self, project_id):
         with self.lock:
             data=self._read(); return data.get(project_id,{"project_id":project_id,"fps":30,"duration":0,"items":[]})
@@ -24,7 +36,11 @@ class TimelineStore:
         with self.lock: data=self._read(); data[project_id]=timeline; self._write(data)
         return timeline
     def add(self, project_id, item):
-        timeline=self.get(project_id); item=dict(item); item.setdefault("id",uuid.uuid4().hex); item.setdefault("start",timeline.get("duration",0)); item.setdefault("duration",5); item.setdefault("track", "video"); timeline["items"].append(item); return self.save(project_id,timeline)
+        timeline=self.get(project_id); item=dict(item); item.setdefault("id",uuid.uuid4().hex); item.setdefault("start",timeline.get("duration",0));
+        detected=self._media_duration(item.get("path"))
+        if detected is not None and str(item.get("kind",""))=="video": item["duration"]=detected
+        else: item.setdefault("duration",5)
+        item.setdefault("track", "video"); timeline["items"].append(item); return self.save(project_id,timeline)
     def update_item(self, project_id, item_id, patch):
         timeline=self.get(project_id); found=False
         for item in timeline["items"]:
