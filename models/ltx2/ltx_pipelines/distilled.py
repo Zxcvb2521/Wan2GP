@@ -1,3 +1,4 @@
+from shared.utils.phase_progress import control_video_encoding
 import logging
 import os
 import time
@@ -288,7 +289,8 @@ class DistilledPipeline:
         if set_progress_status is not None:
             set_progress_status("VAE encoding")
         video_encoder = self._get_model("video_encoder")
-        source_latent = vae_encode_video(source_video, video_encoder, tiling_config).to(device=self.device, dtype=dtype)
+        with control_video_encoding():
+            source_latent = vae_encode_video(source_video, video_encoder, tiling_config).to(device=self.device, dtype=dtype)
 
         if interrupt_check is not None and interrupt_check():
             return None
@@ -350,6 +352,8 @@ class DistilledPipeline:
         ancestral_noise_generator = torch.Generator(device=self.device).manual_seed(int(seed) + 10000) if use_ancestral_sampler else None
 
         def denoising_loop(sigmas, video_state, audio_state, stepper, preview_tools=None):
+            if callback is not None:
+                callback(-1, None, True, override_num_inference_steps=len(sigmas) - 1)
             return euler_denoising_loop(
                 sigmas=sigmas,
                 video_state=video_state,

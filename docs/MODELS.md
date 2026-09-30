@@ -75,6 +75,8 @@ WanGP also ships accelerated defaults and specialist finetunes. Treat names such
 
 Qwen Image includes text-to-image, image editing, multi-reference editing, and layered-image variants. [Qwen Image Edit Plus](modeltype:qwen_image_edit_plus_20B) is a strong default for combining subjects and objects, preserving a scene while editing it, and rendering longer text. Quantized Nunchaku variants are available for supported hardware.
 
+Krea 2 and compatible Qwen Image/Edit models offer a **VAE** dropdown in their model configs: **Qwen Image (Default)** keeps the existing VAE, **Krea 2 Real** offers an alternative for photographic textures, and **Krea 2 HD** offers an alternative for detail and contrast. Results can differ in color and fine detail; compare on your own images. The alternative VAEs use their original FP32 weights and may need more memory than the default. Selecting the Spacepxl VAE upsampler overrides this dropdown at either output multiplier. Qwen Image 2.1, Qwen Layered and Ming Image use different VAEs and do not offer these replacements.
+
 ### Ideogram 4
 
 [Ideogram 4](modeltype:ideogram4) focuses on typography, layout, graphic design, and structured composition. Plain prompts work, but the model-specific Magic Prompt and visual helper make it easier to author its JSON format. Turbo Time and NF4 variants provide alternative speed or memory trade-offs.
@@ -121,3 +123,7 @@ Quantized defaults such as quanto int8, FP8, GGUF, NVFP4, NF4, and Nunchaku redu
 WanGP loads models on demand and can switch without restarting. Use the model selector or toolbar search; the previous model is unloaded as needed to recover memory. Saved settings can retain model inputs and generation options.
 
 The model list can be refreshed after adding or editing a finetune. User-provided checkpoints belong in `finetunes/`; model plugins can contribute additional families and defaults. See [Finetunes](FINETUNES.md), [LoRAs](LORAS.md), and [Plugins](PLUGINS.md) for details.
+
+---
+
+> Applies to: Model family comparisons and selection. The model selector and API provide the current catalogue and capabilities; examples describe named variants and do not replace saved settings or template selections.
