@@ -237,7 +237,8 @@ def get_css() -> str:
 
 
 def get_javascript() -> str:
-    return (Path(__file__).parents[1] / 'gradio/form_sync.js').read_text(encoding='utf-8') + '\n' + "\n".join((Path(__file__).with_name("web") / name).read_text(encoding="utf-8") for name in ("transport.js", "gradio_transport.js", "chat.js", "compact_actions.js", "voice.js", "workspaces.js", "gallery_selection.js", "media_view.js", "workspace_viewer.js", "hybrid_transport.js"))
+    shared_scripts = '\n'.join((Path(__file__).parents[1] / 'gradio' / name).read_text(encoding='utf-8') for name in ('form_sync.js', 'generation_state.js'))
+    return shared_scripts + '\n' + "\n".join((Path(__file__).with_name("web") / name).read_text(encoding="utf-8") for name in ("transport.js", "gradio_transport.js", "chat.js", "compact_actions.js", "voice.js", "workspaces.js", "gallery_selection.js", "media_view.js", "workspace_viewer.js", "hybrid_transport.js"))
 
 
 def _touch_chat(session) -> int:
@@ -1100,6 +1101,8 @@ def build_tool_call_label(
         return _finish_tool_call_label(label if frame is None else f"{label} at Frame {frame}")
     if normalized_name == "draw_svg":
         name = _humanize_tool_value(arguments.get("name"))
+        if arguments.get("video_id"):
+            return _finish_tool_call_label(f"Draw {name or 'SVG'} over Video")
         return _finish_tool_call_label(f"Draw {name}" if name else "Draw SVG Image")
     if normalized_name == "add_to_gallery":
         paths = arguments.get("paths")

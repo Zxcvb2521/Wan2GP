@@ -57,7 +57,13 @@ gradio-app {
 }
 .wangp-settings-actions {
     position: sticky !important;
+    /* Let the gallery and any separate media panel push controls below the
+       viewport instead of covering the preview. The bound scrolls with them. */
+    top: var(--wangp-actions-gallery-top, auto);
     bottom: max(8px, env(safe-area-inset-bottom));
+}
+.wangp-settings-actions,
+.wangp-media-actions {
     z-index: 20;
     flex: 0 0 auto !important;
     padding: 8px;
@@ -66,15 +72,37 @@ gradio-app {
     border-radius: 18px;
     background: transparent;
 }
-.wangp-settings-actions.is-floating {
+.wangp-settings-actions.is-floating,
+.wangp-media-actions.is-floating {
     border-color: color-mix(in srgb, var(--studio-border, var(--border-color-primary)) 20%, transparent);
     background: color-mix(in srgb, var(--studio-surface, var(--background-fill-primary)) 60%, transparent);
     -webkit-backdrop-filter: blur(16px) saturate(130%);
     backdrop-filter: blur(16px) saturate(130%);
     box-shadow: 0 6px 22px rgb(0 0 0 / 8%);
 }
-.wangp-settings-actions button {
+.wangp-settings-actions button,
+.wangp-media-actions button {
     min-width: min(100%, 104px) !important;
+}
+/* Media actions keep their original handlers and a separate landing slot.
+   Only geometry is supplied by JS; panel styling and positioning live here. */
+.wangp-media-actions.is-floating {
+    position: fixed !important;
+    left: var(--wangp-media-actions-left);
+    bottom: var(--wangp-media-actions-bottom);
+    width: var(--wangp-media-actions-width) !important;
+    max-height: calc(100dvh - var(--wangp-media-actions-bottom) - 8px);
+    overflow-y: auto;
+}
+.wangp-media-actions-slot {
+    flex: 0 0 auto;
+    width: 100%;
+    min-width: 0;
+    height: var(--wangp-media-actions-height);
+    pointer-events: none;
+}
+.wangp-media-actions-slot[hidden] {
+    display: none;
 }
 /* Preview visibility still follows the same Gradio generation-state column,
    although its contents now stay beside the gallery rather than in the bar. */
@@ -140,6 +168,10 @@ gradio-app {
     background: var(--background-fill-primary);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
+}
+/* Keep a closing grid's transition from painting behind a restored preview. */
+.gallery-container:has(> .preview) > .grid-wrap > .grid-container {
+    visibility: hidden;
 }
 /* The outer wrapper must not scroll when Chrome reveals a focused thumbnail. */
 .block:has(> .gallery-container) {
@@ -490,13 +522,12 @@ h2 {
     max-height: 95vh;
     overflow: hidden;
 }
-#image-modal-container .modal-close-btn {
-    position: absolute;
-    top: calc(10px * var(--wangp-ui-scale));
-    right: calc(10px * var(--wangp-ui-scale));
+#image-modal-container .modal-close-btn,
+#image-modal-container .wangp-image-zoom-controls button {
     width: calc(40px * var(--wangp-ui-scale));
     height: calc(40px * var(--wangp-ui-scale));
     background-color: rgba(0, 0, 0, 0.5);
+    border: none;
     border-radius: 50%;
     color: #fff;
     font-size: calc(1.8rem * var(--wangp-ui-scale));
@@ -510,9 +541,30 @@ h2 {
     transition: background-color 0.2s, transform 0.2s;
     text-shadow: 0 0 5px rgba(0,0,0,0.5);
 }
-#image-modal-container .modal-close-btn:hover {
+#image-modal-container .modal-close-btn {
+    position: absolute;
+    top: calc(10px * var(--wangp-ui-scale));
+    right: calc(10px * var(--wangp-ui-scale));
+}
+#image-modal-container .modal-close-btn:hover,
+#image-modal-container .wangp-image-zoom-controls button:hover {
     background-color: rgba(0, 0, 0, 0.8);
     transform: scale(1.1);
+}
+#image-modal-container .wangp-image-zoom-controls {
+    top: calc(56px * var(--wangp-ui-scale));
+    right: calc(10px * var(--wangp-ui-scale));
+    gap: calc(6px * var(--wangp-ui-scale));
+}
+#image-modal-container .wangp-image-zoom-controls button > div {
+    width: calc(1.8rem * var(--wangp-ui-scale));
+    height: calc(1.8rem * var(--wangp-ui-scale));
+}
+#image-modal-container .modal-image-viewport {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 0;
 }
 #image-modal-container .modal-label {
     position: absolute;
@@ -526,8 +578,10 @@ h2 {
     z-index: 1001;
 }
 #image-modal-container .modal-image {
-    width: 100%;
-    height: 100%;
+    max-width: 95vw;
+    max-height: 95vh;
+    width: auto;
+    height: auto;
     object-fit: contain;
 }
 .progress-container-custom {
