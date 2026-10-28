@@ -16,7 +16,8 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
-from . import allocator, cuda_graphs, memory_pressure, runtime
+from . import allocator, cuda_graphs, memory_pressure, pinned, runtime
+from .read_ahead import cold_ranges, prefetch_ranges
 
 MARGIN = 512 << 20
 UPLOAD_STAGING = 32 << 20  # bytes of each of the two pinned buffers through which new GPU copies go
@@ -95,6 +96,7 @@ class Residency:
         self.pressure_ceiling = None
         self.pinned = {}  # (bank, expert) -> checkpoint name -> pinned copy, the source of its uploads (pin())
         self._pinned_holder = None
+        self.upload_staging = [pinned.Buffer("experts") for _ in range(2)]  # the two locked buffers of _upload, kept until close()
         # Every prefix spreads individual experts across layers; no whole-bank minimum. With priorities, the most used experts of all
         # layers come first (equal priorities keep this order).
         self.ranking = [(bank, expert) for expert in range(max(bank.num_experts for bank in self.banks)) for bank in self.banks if expert < bank.num_experts]
@@ -110,6 +112,8 @@ class Residency:
     def close(self):
         self.unload()
         self.pinned, self._pinned_holder = {}, None
+        for buffer in self.upload_staging:
+            buffer.release()
         memory_pressure.unregister(self)
         for bank in self.banks:
             bank._residency = None
@@ -224,7 +228,7 @@ class Residency:
             self.loaded = dict.fromkeys(wanted)
             self.applied = count
             if self.manager().verboseLevel >= 1:
-                print(f"Expert Residency - {self.model_id}: {len(self.loaded)}/{len(self.ranking)} Experts on GPU ({self.nbytes / (1 << 20):.0f} MiB); CPU Experts Are Not Pinned")
+                tqdm.write(f"Expert Residency - {self.model_id}: {len(self.loaded)}/{len(self.ranking)} Experts on GPU ({self.nbytes / (1 << 20):.0f} MiB); CPU Experts Are Not Pinned")
         finally:
             self.changing = False
             self._placement_changed()
@@ -232,19 +236,28 @@ class Residency:
     def _upload(self, additions):
         """GPU copies of new experts, from their pinned copies (pin()) or else through two pinned buffers: copying the next experts from
         their pageable (mmap) sources overlaps the transfer of the previous ones. These copies are only made when the placement changes.
-        With MMGP's read-ahead, the pageable sources are read from the disk ahead of these copies, in their order."""
+        Sources that a drive must read are read ahead in large requests, the next expert while the current one is copied (the parallel CPU
+        copy would fault them in 64 KiB reads)."""
         size = max(UPLOAD_STAGING, 2 * max(self.sizes.values()))
-        staging = [torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True) for _ in range(2)]
+        with torch.inference_mode(False):  # reused by the uploads that follow, whatever their inference mode
+            staging = [buffer.get(size) for buffer in self.upload_staging]
+        if None in staging:
+            raise RuntimeError(f"Unable to lock {2 * size / 2**20:.0f} MB of RAM for the expert uploads of {self.model_id}")
         transfers = [torch.cuda.Event(), torch.cuda.Event()]
         slot, offset = 0, 0
-        read_ahead, job, position = self.manager().read_ahead, None, 0
-        if read_ahead is not None:
-            sources = [getattr(bank, name)[expert] for bank, expert in additions for name in bank.expert_tensor_names if name not in self.pinned.get((bank, expert), {})]
-            job = read_ahead.schedule(read_ahead.mappings.plan([(tensor.data_ptr(), tensor.numel() * tensor.element_size()) for tensor in sources]))
-            del sources
+
+        def sources(index):
+            bank, expert = additions[index]
+            return [(tensor.data_ptr(), tensor.numel() * tensor.element_size()) for name in bank.expert_tensor_names
+                    if name not in self.pinned.get((bank, expert), {}) for tensor in (getattr(bank, name)[expert],)]
+
+        if additions:
+            prefetch_ranges(cold_ranges(sources(0)))
         try:
-            for bank, expert in tqdm(additions, desc=f"Preloading Experts - {self.model_id}", unit="expert", mininterval=1 / 3, disable=self.manager().verboseLevel < 1):
+            for index, (bank, expert) in enumerate(tqdm(additions, desc=f"Preloading Experts - {self.model_id}", unit="expert", mininterval=1 / 3, disable=self.manager().verboseLevel < 1)):
                 runtime.checkpoint()
+                if index + 1 < len(additions):
+                    prefetch_ranges(cold_ranges(sources(index + 1)))
                 if offset + self.sizes[bank] + 64 * len(bank.expert_tensor_names) > size:
                     transfers[slot].record()
                     slot, offset = 1 - slot, 0
@@ -257,19 +270,14 @@ class Residency:
                         continue
                     source = getattr(bank, name)[expert]
                     nbytes = source.numel() * source.element_size()
-                    pinned = staging[slot][offset:offset + nbytes].view(source.dtype).view(source.shape)
-                    pinned.copy_(source)
-                    if job is not None:
-                        job.complete(position, nbytes)  # the hints move on beyond what is copied
-                    position += nbytes
-                    tensors[name] = torch.empty_like(source, device="cuda").copy_(pinned, non_blocking=True)
+                    staged = staging[slot][offset:offset + nbytes].view(source.dtype).view(source.shape)
+                    staged.copy_(source)
+                    tensors[name] = torch.empty_like(source, device="cuda").copy_(staged, non_blocking=True)
                     offset += -(-nbytes // 64) * 64
                 bank._place(expert, tensors)
                 self.loaded[(bank, expert)] = None
                 self.nbytes += self.sizes[bank]
         finally:
-            if job is not None:
-                job.finish()
             transfers[slot].record()
             transfers[slot].synchronize()  # also orders the other buffer's transfers, queued before on the same stream
 

@@ -22,7 +22,7 @@ def _wgp_installed():
 
 
 CHOICES = [("Disabled: PyTorch (slowest, most precise)", "disabled"), ("Auto (best available)", "auto"),
-           (f"WGPKernels (recommended,{'installed' if _wgp_installed() else 'not installed'}, second fastest, precise)", "wgpkernels"),
+           (f"WGPKernels (recommended, {'installed' if _wgp_installed() else 'not installed'}, second fastest, precise)", "wgpkernels"),
            ("Triton (fast, less precise)", "triton"), ("Comfy Kitchen Kernels (fastest, least precise)", "kitchen")]
 _LABELS = {"wgpkernels": "WGPKernels", "kitchen": "Comfy Kitchen", "triton": "Triton"}
 _backend = "pytorch"
@@ -111,8 +111,9 @@ def _probe_wgpkernels():
         return None, "requires a GPU"
     if torch.version.hip is not None and not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1201"):
         return None, "requires an AMD RDNA4 GPU (gfx1201) with ROCm"
-    if torch.version.hip is None and torch.cuda.get_device_capability() < (8, 0):
-        return None, "requires an NVIDIA GPU with compute capability 8.0 or newer"
+    # Turing (7.5) runs builds that include sm_75 code; on older builds the selftest below fails (no kernel image) and Auto moves on
+    if torch.version.hip is None and torch.cuda.get_device_capability() < (7, 5):
+        return None, "requires an NVIDIA GPU with compute capability 7.5 or newer"
     try:
         module = importlib.import_module("wgpkernels.int8")
         if module._lib is None:
@@ -199,7 +200,28 @@ def wgp_linear(input, weight, bias=None, group=0, precise=False, act=None, act_w
         y = out.view(-1, n)
     y = _wgp.linear(_wgp_aligned(x), weight._data, scale, bias, group, precise, act=act, act_weight=act_weight, eps=act_eps, residual=residual,
                     residual_scale=residual_scale, out=y)
-    return out if out is not None else y.reshape(*input.shape[:-1], n)
+    if out is None:
+        return y.reshape(*input.shape[:-1], n)
+    torch.autograd.graph.increment_version(out)  # written in place: MMGP CUDA graphs copy a mutated block argument back
+    return out
+
+
+def wgp_group_scales(input, weight):
+    """Whether WGPKernels computes an INT8 weight with one FP32 scale per output channel and 128-column block (scale (N, K / 128)):
+    the selected backend, with a library taking such scales, on BF16/FP16 CUDA activations (K a multiple of 16)."""
+    return (_backend == "wgpkernels" and getattr(_wgp, "weight_groups_supported", lambda: False)() and input.is_cuda and input.dtype in (torch.bfloat16, torch.float16)
+            and weight.is_cuda and input.shape[-1] % 16 == 0)
+
+
+def wgp_group_linear(input, weight, scale, bias=None):
+    """input @ (weight (N, K) INT8 * scale (N, K / 128) per 128-column block).T + bias with WGPKernels, which choose the path per GPU and
+    shape as for the other INT8 weights."""
+    x = input.reshape(-1, input.shape[-1])
+    if bias is not None and bias.dtype != x.dtype:
+        bias = bias.to(x.dtype)
+    if torch.compiler.is_compiling() or triton._is_fake_tensor(input):
+        return torch.ops.wan2gp_wgp.linear(x, weight, scale, bias, 0, False).reshape(*input.shape[:-1], weight.shape[0])
+    return _wgp_run(x, weight, scale, bias, 0, False).reshape(*input.shape[:-1], weight.shape[0])
 
 
 def linear_fused(input, weight, bias, group, input_act, act_weight, act_eps, residual, residual_scale, out=None):
@@ -361,17 +383,20 @@ def _wide_convrot_linear(input, weight, bias=None):
     return out.reshape(*input.shape[:-1], weight.shape[0])
 
 
-def can_fuse_linear(module, x, dtypes=(torch.bfloat16,)):
+def can_fuse_linear(module, x, dtypes=(torch.bfloat16,), act=None):
     """Keep qtype/backend details out of model code; MMGP still owns module calls.
-    Callers widen `dtypes` only for activation dtypes validated with their model.
+    Callers widen `dtypes` only for activation dtypes validated with their model; act is the input operation they want fused
+    ('rms_norm', 'swiglu', or 'gelu', which only WGPKernels provide).
     WGPKernels fuse with the precision of their unfused linears (full precision or per-block activations, input operations in FP32,
     one rounding), whatever the kernel precision setting; Comfy Kitchen's rowwise fusions need the fast (approximate) setting."""
     if (torch.compiler.is_compiling() or not torch.is_inference_mode_enabled() or triton._is_fake_tensor(x) or not x.is_cuda
             or x.dtype not in dtypes or (getattr(module, '_mm_lora_old_forward', None) and getattr(module, '_mm_lora_data', None) != {})):
         return False
     if _backend == "wgpkernels":
-        return getattr(module, '_convrot_group_size', 0) in (16, 64, 256) and module.in_features % 16 == 0
-    return (kernel_policy.allow_approximate() and kitchen_enabled() and _sm120_cutlass
+        group = getattr(module, '_convrot_group_size', 0)
+        quanto = group == 0 and getattr(getattr(module, 'weight_qtype', None), 'name', None) == "qint8"  # plain INT8 (Quanto files)
+        return act in _wgp.ACTS and (group in (16, 64, 256) or quanto) and module.in_features % 16 == 0
+    return (act != "gelu" and kernel_policy.allow_approximate() and kitchen_enabled() and _sm120_cutlass
             and getattr(module, '_convrot_group_size', 0) == 256
             and 256 <= module.in_features <= 16384 and module.in_features % 256 == 0
             and module.out_features % 8 == 0
@@ -383,7 +408,11 @@ def linear_with_fusion(module, x, *, input_act=None, act_weight=None, act_eps=0.
     # Quanto's router accepts only x. Keep its normal module/offload hooks while
     # handing the qtype the extra operands for this synchronous call only.
     previous = getattr(module, '_wangp_linear_fusion', None)
-    module._wangp_linear_fusion = (input_act, act_weight, act_eps, residual, residual_scale, out)
+    fusion = module._wangp_linear_fusion = (input_act, act_weight, act_eps, residual, residual_scale, out)
+    # Quanto's linear function receives the weight tensor, not the module: the operands ride on the weight for that call
+    qweight = getattr(module, 'qweight', None) if getattr(getattr(module, 'weight_qtype', None), 'name', None) == "qint8" else None
+    if qweight is not None:
+        qweight._wangp_linear_fusion = fusion
     try:
         return module(x)
     finally:
@@ -391,19 +420,22 @@ def linear_with_fusion(module, x, *, input_act=None, act_weight=None, act_eps=0.
             del module._wangp_linear_fusion
         else:
             module._wangp_linear_fusion = previous
+        if qweight is not None:
+            del qweight._wangp_linear_fusion
 
 
 def _call_prepared(module, x, prepared):
     """module(x) with its input already prepared (and its output tile): the module's own hooks run, MMGP's weight loading included."""
-    previous = getattr(module, '_wangp_prequantized_input', None)
-    module._wangp_prequantized_input = prepared
+    target = module.qweight if module.weight_qtype.name == "qint8" else module  # Quanto's forward receives the weight, not the module
+    previous = getattr(target, '_wangp_prequantized_input', None)
+    target._wangp_prequantized_input = prepared
     try:
         module(x)
     finally:
         if previous is None:
-            del module._wangp_prequantized_input
+            del target._wangp_prequantized_input
         else:
-            module._wangp_prequantized_input = previous
+            target._wangp_prequantized_input = previous
 
 
 def _wgp_path(module, x, group, precise=False):
@@ -413,10 +445,10 @@ def _wgp_path(module, x, group, precise=False):
 
 
 def linear_multi(modules, x):
-    """Reuse one bounded ConvRot input tile across projections, retaining MMGP hooks."""
+    """Reuse one bounded INT8 input tile across projections, retaining MMGP hooks."""
     if _backend == "wgpkernels":
-        group = modules[0]._convrot_group_size
-        if any(module._convrot_group_size != group for module in modules):
+        group = getattr(modules[0], '_convrot_group_size', 0)
+        if any(getattr(module, '_convrot_group_size', 0) != group for module in modules):
             return [module(x) for module in modules]
         x = _wgp_aligned(x)
         outputs = [x.new_empty((x.shape[0], module.out_features)) for module in modules]
@@ -507,7 +539,7 @@ def kitchen_linear_fused(input, weight, bias, input_act, act_weight, act_eps, re
     if out is not None and (out.shape != (*input.shape[:-1], n) or out.dtype != input.dtype
                             or out.device != input.device or not out.is_contiguous()):
         raise ValueError("Fused INT8 output must match the output shape, dtype and device and be contiguous")
-    out = input.new_empty((x.shape[0], n)) if out is None else out.reshape(-1, n)
+    supplied, out = out, input.new_empty((x.shape[0], n)) if out is None else out.reshape(-1, n)
     r = residual.reshape(-1, n) if residual is not None else None
     # The raw ConvRot quantizer requires packed rows, including fused SwiGLU input.
     row_bytes = k + 4 + (x.shape[-1] * x.element_size() if not x.is_contiguous() else 0)
@@ -539,6 +571,8 @@ def kitchen_linear_fused(input, weight, bias, input_act, act_weight, act_eps, re
         if not used:
             raise RuntimeError("Comfy Kitchen rejected the fused SM120 INT8 output tile")
         del q, qs, tile
+    if supplied is not None:
+        torch.autograd.graph.increment_version(supplied)  # written in place: MMGP CUDA graphs copy a mutated block argument back
     return out.reshape(*input.shape[:-1], n)
 
 
@@ -722,7 +756,15 @@ def _quanto_forward(ctx, input, weight, bias=None):
 def _wgp_quanto_forward(ctx, input, weight, bias=None):
     if _wgp_supports(input, weight):
         ctx.save_for_backward(input, weight)
-        return wgp_linear(input, weight, bias)
+        prepared = weight.__dict__.get('_wangp_prequantized_input')
+        if prepared is not None:
+            return linear_prequantized(weight, bias, *prepared)
+        fusion = weight.__dict__.get('_wangp_linear_fusion')  # set by linear_with_fusion for this call (plain INT8: rotation group 0)
+        if fusion is None:
+            return wgp_linear(input, weight, bias)
+        input_act, act_weight, act_eps, residual, residual_scale, out = fusion
+        return wgp_linear(input, weight, bias, act=input_act, act_weight=act_weight, act_eps=act_eps, residual=residual,
+                          residual_scale=residual_scale, out=out)
     return _original_forward(ctx, input, weight, bias)
 
 

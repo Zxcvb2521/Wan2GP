@@ -86,7 +86,7 @@ class Flux3Pipeline:
         # The released schedule and random generator run on CPU, independent of
         # PyTorch's default device; Euler state remains FP32 between steps.
         schedule = torch.linspace(1, 0, sampling_steps + 1, device='cpu')
-        schedule = 6.93 * schedule / (1 + 5.93 * schedule)
+        schedule = 16.0 * schedule / (1 + 15.0 * schedule)
         schedule_device = schedule.to(device)
         results = []
         for image_no in range(batch_size):
@@ -128,7 +128,8 @@ def load_pipeline(model_filename, text_encoder_filename, base_model_type, model_
     with torch.device('cpu'):
         encoder.language_model.rotary_emb.reset_inv_freq()
     offload.load_model_data(transformer, model_filename, writable_tensors=False, default_dtype=torch.bfloat16, fused_split_map=transformer.split_linear_modules_map)
-    offload.load_model_data(encoder, text_encoder_filename, modelPrefix='model', writable_tensors=False, default_dtype=torch.bfloat16, ignore_unused_weights=True)
+    offload.load_model_data(encoder, text_encoder_filename, writable_tensors=False, default_dtype=torch.bfloat16, ignore_unused_weights=True)  # the shared Qwen3-VL-4B file: language_model.* used, visual.* ignored
+    runtime.lookup_on_cpu(encoder.language_model.embed_tokens)  # the 0.7 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
     offload.load_model_data(vae, fl.locate_file('flux3/flux2-vae.safetensors'), writable_tensors=False, default_dtype=torch.bfloat16)
     transformer.eval()
     encoder.eval()

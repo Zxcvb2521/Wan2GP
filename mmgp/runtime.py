@@ -109,6 +109,41 @@ def execution_device(module):
     return torch.device("cpu") if tensor is None else tensor.device
 
 
+def lookup_on_cpu(*modules):
+    """Mark modules that MMGP computes on the CPU, their weights kept in RAM, never in VRAM: a token table only gathers the rows of a
+    prompt, the same values as on the GPU, without moving the whole table (2 GB for an umT5 or a Gemma 3) at each load. Their tensor
+    inputs go to the CPU and their output comes back to the execution device. Call it on the loaded modules, before the offload
+    profile: a quantized table (a module whose tensors are not plain) keeps the GPU path of its qtype. A module tied to a marked one
+    (a head sharing the table) must be marked too, with unused when it never runs."""
+    for module in modules:
+        module._mm_on_cpu = True
+
+
+def map_in_ram(*modules):
+    """Mark modules whose parameters MMGP keeps in reserved RAM mapped in the GPU's address space, never in VRAM: their kernels read the
+    rows they need in place, over the bus, inside CUDA graphs too and with indices computed on the GPU (a token table read for a few tokens
+    at each step). The parameters stay the modules' own, as CUDA views of their RAM, outside the blocks, base and budgets; the RAM is
+    charged to the reserved RAM while it exists. Parameters of other modules sharing their tensors follow them: never mark a table that a
+    module reads whole at each call (a head tied to it), which would read it over the bus. Call it on the loaded modules, before the offload
+    profile; without CUDA, or without reserved RAM left, the modules keep their usual placement."""
+    for module in modules:
+        module._mm_mapped = True
+
+
+def is_mapped(tensor):
+    """True for a parameter kept in mapped RAM (map_in_ram): a CUDA view of RAM, whose reads cross the bus."""
+    from .mapped import is_mapped
+    return is_mapped(tensor)
+
+
+def unused(*modules):
+    """Mark modules that never run, such as the output head of a language model whose hidden states condition a generator (called through
+    its base model): MMGP keeps their weights in RAM, out of VRAM, pinning and budgets, quantized or not, and raises if one runs. Call it on
+    the loaded modules, before the offload profile."""
+    for module in modules:
+        module._mm_unused = True
+
+
 def ensure_loaded(module):
     """Load a managed model's base/preloaded weights; leave block swapping to MMGP.
 
@@ -121,19 +156,81 @@ def ensure_loaded(module):
         manager.ensure_model_loaded(model_id)
 
 
+def state_ring(blocks, name="state", resident=False):
+    """A state ring (mmgp.state_ring.StateRing) for tensors a model computes once per block and reads at every pass (a cached attention
+    prefix), blocks: the model's blocks (a ModuleList, called one by one). Kept in RAM and streamed block by block on the transfer stream of
+    the model's offload object, with the weights, following MMGP's schedule for these blocks (its prefetch window; records locked for the
+    blocks whose weights are pinned, then, for a model MMGP pins, for those kept in VRAM, as far as the reserved RAM allows; the others moved
+    ahead through MMGP's staging ring with their blocks): each block's forward fetches its state. The model calls store(block, tensors) once per block, and release() at the end.
+    resident: blocks whose weights MMGP keeps in VRAM may keep their state there too, in the room their preload leaves (see mmgp.state_ring;
+    the model then reads the lists store() returns at each pass)."""
+    from .state_ring import StateRing
+    owner = _owner(blocks)
+    if owner is None:
+        return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), None, name, modules=blocks)
+    manager, model_id = owner
+    prefix = next(name for name, module in manager.models[model_id].named_modules() if module is blocks) + "."
+    entries = [f"{model_id}/{prefix}{index}" for index in range(len(blocks))]  # the blocks' entries: the ring follows their schedule
+    return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), manager, name, modules=blocks, model_id=model_id, entries=entries,
+                     resident=resident)
+
+
 def weights_resident(module):
-    """Whether a managed model's weights are all in VRAM now (loaded, no block streamed; expert banks aside): an MMGP graph stage
-    may then span several of its blocks (see cuda_graphs.run). Check it at each call: a dynamic preload can release blocks between
-    calls. Unmanaged modules: True."""
+    """Whether the weights of a managed module are all in VRAM now (its model loaded, none of the blocks under the module streamed; expert
+    banks aside): an MMGP graph stage that runs this module may then span several of its blocks (see cuda_graphs.run). For a submodule
+    (e.g. the language model of a larger model), only its own blocks count: blocks the stage never runs may stay out of VRAM. Check it at
+    each call: a dynamic preload can release blocks between calls. Unmanaged modules: True."""
     owner = _owner(module)
     if owner is None:
         return True
     manager, model_id = owner
     if model_id not in manager.active_models_ids:
         return False
+    names = _block_names.get(manager)
+    if names is None:  # the blocks of a model are those of its profile
+        names = _block_names[manager] = {}
+    model = manager.models[model_id]
+    blocks = names.get((model_id, id(module)))
+    if blocks is None:
+        prefix = model_id + "/" + ("" if module is model else next(name for name, m in model.named_modules() if m is module) + ".")
+        blocks = names[(model_id, id(module))] = [name[len(model_id) + 1:] for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(prefix)]
     preloaded = manager.preloaded_blocks_per_model[model_id]
-    prefix = model_id + "/"
-    return all(name[len(prefix):] in preloaded for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(prefix))
+    return all(name in preloaded for name in blocks)
+
+
+_block_names = weakref.WeakKeyDictionary()  # an offload manager -> (model id, id of a module of the model) -> the names of its blocks
+_tower_entries = weakref.WeakKeyDictionary()  # a tower (ModuleList) -> (model id, the entry name of each of its blocks)
+
+
+def resident_runs(module, blocks):
+    """The blocks of a tower of a managed model (a ModuleList of its blocks) as runs (start, stop, resident) that cover them in order:
+    the blocks of a resident run are kept in VRAM now, the others are streamed when they run (all are resident while their model is
+    loaded whole). The first block of a tower where an automatic preload starts its cycles is a run of its own, not resident, as are
+    the blocks of a model not loaded yet. Query it at each pass: a dynamic preload changes the blocks kept between calls."""
+    owner = _owner(module)
+    if owner is None:
+        return ((0, len(blocks), True),)
+    manager, model_id = owner
+    entries = _tower_entries.get(blocks)
+    if entries is None or entries[0] != (id(manager), model_id):
+        model = manager.models[model_id]
+        prefix = next(name for name, submodule in model.named_modules() if submodule is blocks) + "."
+        names = [prefix + str(index) for index in range(len(blocks))]
+        entries = _tower_entries[blocks] = ((id(manager), model_id), [name if manager.blocks_of_modules_sizes.get(model_id + "/" + name) else None for name in names])
+    names = entries[1]
+    if model_id not in manager.active_models_ids:
+        return ((0, len(blocks), False),)
+    preloaded = manager.preloaded_blocks_per_model[model_id]
+    flags = [name is None or name in preloaded for name in names]
+    plan = None if manager.auto_preload is None else manager.auto_preload.plans.get(model_id)
+    if plan is not None and names and plan.first == names[0]:
+        flags[0] = False
+    runs, start = [], 0
+    for index in range(1, len(flags) + 1):
+        if index == len(flags) or flags[index] != flags[start] or not flags[start]:
+            runs.append((start, index, flags[start]))
+            start = index
+    return tuple(runs)
 
 
 def place_experts(module):
@@ -147,6 +244,16 @@ def place_experts(module):
     manager, model_id = owner
     residency = manager.expert_residency.get(model_id)
     return residency is None or residency.place()
+
+
+def dynamic_preload(module):
+    """Whether an automatic VRAM preload manages this model's blocks: it keeps as many as fit and releases some when another allocation
+    needs VRAM (a co-tenant loaded beside it then takes only what it needs), keeping them again later as they run."""
+    owner = _owner(module)
+    if owner is None:
+        return False
+    manager, model_id = owner
+    return manager.auto_preload is not None and model_id in manager.auto_preload.plans
 
 
 def requires_layer_offload(module):

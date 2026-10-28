@@ -12,6 +12,7 @@ from typing import Union,Optional
 from mmgp import offload
 from mmgp.offload import get_cache, clear_caches
 from shared import attention_kit
+from shared.kernels import ops as kernels
 from shared.attention import pay_attention
 from torch.backends.cuda import sdp_kernel
 from ..multitalk.multitalk_utils import get_attn_map_with_target
@@ -23,7 +24,7 @@ from ..scail2 import build_scail2_pose_tokens
 from ..steadydancer.small_archs import FactorConv3d, PoseRefNetNoBNV3
 from ..steadydancer.mobilenetv2_dcd import DYModule
 from ..shotplan import inject_shotplan_tokens
-from ..animate2 import animate2_attention_block, animate2_cached_attention_block
+from ..animate2 import animate2_attention_block, animate2_cached_attention_block, load_cached as animate2_load_cached, store_kv as animate2_store_kv
 
 __all__ = ['WanModel']
 
@@ -46,6 +47,29 @@ def reshape_latent(latent, latent_frames):
 
 def restore_latent_shape(latent):
     return latent.reshape(latent.shape[0], -1, latent.shape[-1] )
+
+def frame_modulation(modulation, e):
+    """modulation (1, n, dim) + e (frames, n or 1, dim) as n contiguous (1, frames, dim) rows: per latent frame shifts, scales and gates
+    for modulate_frames, gated_frames_, the output projection's gate and kernels.gate_segments; the same sums as before."""
+    return (modulation + e).transpose(0, 1).contiguous().chunk(modulation.shape[1])
+
+def frame_segments(batch, tokens, frames):
+    """(start, stop, frame) row ranges of the flattened (batch * tokens) rows, one per latent frame: segments of kernels.norm_modulate
+    and kernels.gated_linear for (frames, dim) tables."""
+    span = tokens // frames
+    return [(b * tokens + f * span, b * tokens + (f + 1) * span, f) for b in range(batch) for f in range(frames)]
+
+def modulate_frames(x, norm, shift, scale, dtype=None):
+    """norm(x) * (1 + scale) + shift per latent frame (shift, scale: (1, frames, dim) rows of frame_modulation), x (batch, tokens, dim)
+    borrowed; the norm output cast to dtype first when given."""
+    segments = frame_segments(x.shape[0], x.shape[1], shift.shape[1])
+    return kernels.norm_modulate([x.view(-1, x.shape[-1])], norm, shift[0], scale[0], segments, dtype=dtype).view(x.shape)
+
+def gated_frames_(x, y_list, gate):
+    """x += y * gate per latent frame, in place (gate (1, frames, dim), y handed off in y_list); returns x."""
+    frames = gate.shape[1]
+    y_list[0] = reshape_latent(y_list[0], frames)
+    return restore_latent_shape(kernels.gated_residual_(reshape_latent(x, frames), y_list, gate.unsqueeze(2), fused=True))
 
 
 def identify_k( b: float, d: int, N: int):
@@ -317,7 +341,15 @@ class WanSelfAttention(nn.Module):
             return x, q
         else:
             return x, None
-    
+
+    def _project(self, x, residual, gate):
+        """o(x), or residual += gate * o(x) per latent frame (gate (frames, dim)) written into residual and returned."""
+        if residual is None:
+            return self.o(x)
+        x_list, x = [x.reshape(-1, x.shape[-1])], None
+        rows = residual.view(-1, residual.shape[-1])
+        return kernels.gated_linear(self.o, x_list, rows, gate, frame_segments(residual.shape[0], residual.shape[1], gate.shape[0])).view(residual.shape)
+
     def _norm_rope_(self, query, key, group, freqs):
         """attention_kit callback: norm_q/norm_k (over all heads) and RoPE of q and/or k in place."""
         for tensor, norm, heads, index in ((query, self.norm_q, group.q, 0), (key, self.norm_k, group.kv, 1)):
@@ -331,7 +363,7 @@ class WanSelfAttention(nn.Module):
                 rows.mul_(norm.weight[heads.start * self.head_dim:heads.stop * self.head_dim])
             apply_rotary_emb_single([tensor], freqs, head_first=False)
 
-    def forward(self, xlist, grid_sizes, freqs, block_mask = None, ref_target_masks = None, ref_images_count = 0, standin_phase =-1, lynx_ref_buffer = None, lynx_ref_scale = 0, sub_x_no=0):
+    def forward(self, xlist, grid_sizes, freqs, block_mask = None, ref_target_masks = None, ref_images_count = 0, standin_phase =-1, lynx_ref_buffer = None, lynx_ref_scale = 0, sub_x_no=0, residual=None, gate=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -343,7 +375,7 @@ class WanSelfAttention(nn.Module):
             x = attention_kit.qkv_attention(xlist, self.q, self.k, self.v, self.num_heads, self.head_dim,
                                             lambda query, key, group: self._norm_rope_(query, key, group, freqs),
                                             norm_spans_heads=isinstance(self.norm_q, WanRMSNorm))
-            return self.o(x.flatten(2)), None
+            return self._project(x.flatten(2), residual, gate), None
         x = xlist[0]
         xlist.clear()
 
@@ -433,9 +465,7 @@ class WanSelfAttention(nn.Module):
             else:
                 x.add_(ref_hidden_states, alpha= lynx_ref_scale) 
 
-        x = x.flatten(2)
-        x = self.o(x)
-        return x, x_ref_attn_map
+        return self._project(x.flatten(2), residual, gate), x_ref_attn_map
 
 
 class WanT2VCrossAttention(WanSelfAttention):
@@ -659,14 +689,9 @@ class WanAttentionBlock(nn.Module):
                 else:
                     hints_processed.append(self.vace(hint, x, **kwargs) if self.block_id == 0 else self.vace(hint, None, **kwargs))
                      
-        latent_frames = e.shape[0]
-        e = (self.modulation.weight + e).chunk(6, dim=1)
+        e = frame_modulation(self.modulation.weight, e)
         # self-attention
-        x_mod = self.norm1(x)
-        x_mod = reshape_latent(x_mod , latent_frames)
-        x_mod *= 1 + e[1]
-        x_mod += e[0]
-        x_mod = restore_latent_shape(x_mod)
+        x_mod = modulate_frames(x, self.norm1, e[0], e[1])
 
         if cam_emb != None:
             cam_emb = self.cam_encoder(cam_emb)
@@ -681,14 +706,14 @@ class WanAttentionBlock(nn.Module):
         xlist = [x_mod.to(attention_dtype)]
         if lynx_feature_extractor: get_cache("lynx_ref_buffer")[sub_x_no][self.block_no] = xlist[0]
         del x_mod
-        y, x_ref_attn_map = self.self_attn( xlist, grid_sizes, freqs, block_mask = block_mask, ref_target_masks = multitalk_masks, ref_images_count = ref_images_count, standin_phase= standin_phase, lynx_ref_buffer = lynx_ref_buffer, lynx_ref_scale = lynx_ref_scale, sub_x_no = sub_x_no)
-        y = y.to(dtype)
-
-        if cam_emb != None: y = self.projector(y)
-
-        x, y = reshape_latent(x , latent_frames), reshape_latent(y , latent_frames)
-        x.addcmul_(y, e[2])
-        x, y = restore_latent_shape(x), restore_latent_shape(y)
+        gated = cam_emb is None  # the output projection adds its output, gated per latent frame, into x
+        y, x_ref_attn_map = self.self_attn( xlist, grid_sizes, freqs, block_mask = block_mask, ref_target_masks = multitalk_masks, ref_images_count = ref_images_count, standin_phase= standin_phase, lynx_ref_buffer = lynx_ref_buffer, lynx_ref_scale = lynx_ref_scale, sub_x_no = sub_x_no,
+                                            residual = x if gated else None, gate = e[2][0])
+        if gated:
+            x = y
+        else:
+            y_list = [self.projector(y.to(dtype))]
+            x = gated_frames_(x, y_list, e[2])
         del y
 
         if context is not None:
@@ -714,33 +739,10 @@ class WanAttentionBlock(nn.Module):
                 x = fuse_with_image_ref(x, y, ref_images_count, grid_sizes)
                 del y
 
-        y = self.norm2(x)
+        y = modulate_frames(x, self.norm2, e[3], e[4]).to(attention_dtype)
 
-        y = reshape_latent(y , latent_frames)
-        y *= 1 + e[4]
-        y += e[3]
-        y = restore_latent_shape(y)
-        y = y.to(attention_dtype)
-
-        ffn = self.ffn[0]
-        gelu = self.ffn[1]
-        ffn2= self.ffn[2]
-
-        y_shape = y.shape
-        y = y.view(-1, y_shape[-1])
-        chunk_size = max(1, int(y.shape[0]/5.4)) # expanded chunks of about half the hidden states
-        chunks =torch.split(y, chunk_size)
-        for y_chunk  in chunks:
-            mlp_chunk = ffn(y_chunk)
-            for part in torch.split(mlp_chunk, max(1, (64 << 20) // (mlp_chunk.shape[-1] * mlp_chunk.element_size()))):
-                part.copy_(gelu(part)) # in place by rows: the same values without a second expanded chunk
-            y_chunk[...] = ffn2(mlp_chunk)
-            del mlp_chunk
-        y = y.view(y_shape)
-        y = y.to(dtype)
-        x, y = reshape_latent(x , latent_frames), reshape_latent(y , latent_frames)
-        x.addcmul_(y, e[5])
-        x, y = restore_latent_shape(x), restore_latent_shape(y)
+        y_list, y = [y], None  # the FFN by chunks, its output gated per latent frame into x
+        kernels.mlp(y_list, self.ffn[0], self.ffn[2], "gelu", residual=x, segments=kernels.gate_segments(e[5], x.shape[0], x.shape[1]))
 
         if hints_processed is not None:
             for hint, scale in zip(hints_processed, context_scale):
@@ -885,15 +887,9 @@ class Head(nn.Module):
         # assert e.dtype == torch.float32
         x = x_list[0]  # handed off: the hidden states are released once normalized, before the float32 copy
         x_list.clear()
-        dtype = x.dtype
 
-        latent_frames = e.shape[0]
-        e = (self.modulation.weight + e.unsqueeze(1)).chunk(2, dim=1)
-        x = self.norm(x).to(dtype)
-        x = reshape_latent(x , latent_frames)
-        x *= (1 + e[1])
-        x += e[0]
-        x = restore_latent_shape(x)
+        e = frame_modulation(self.modulation.weight, e.unsqueeze(1))
+        x = modulate_frames(x, self.norm, e[0], e[1])
         x= x.to(self.head.weight.dtype)
         x = self.head(x)
         return x
@@ -1596,7 +1592,7 @@ class WanModel(ModelMixin, ConfigMixin):
         animate2_ref_clip_fea = None,
         animate2_ref_freqs = None,
         animate2_log_scale = 0.0,
-        animate2_kv_cache = "Disabled",
+        animate2_kv_cache = "Disabled",  # GPU (exact), INT8 (K/V on the GPU), RAM (INT8 K/V in RAM) (animate2.py)
         camera_adapter_features = None,
         uni3c_condition = None,
     ):
@@ -1641,7 +1637,7 @@ class WanModel(ModelMixin, ConfigMixin):
             scail2_ref_latents_list = [scail2_ref_latents] * len(x_list)
         bernini_enabled = bernini_sources is not None
         animate2_enabled = animate2_ref_x is not None
-        animate2_cache = get_cache("animate2_kv") if animate2_enabled and animate2_kv_cache in ("GPU", "RAM") else None
+        animate2_cache = get_cache("animate2_kv") if animate2_enabled and animate2_kv_cache != "Disabled" else None
         animate2_cached = animate2_cache is not None and len(animate2_cache.get("blocks", [])) == len(self.blocks)
         bernini_freqs_list = []
         bernini_output_slices = []
@@ -2083,11 +2079,14 @@ class WanModel(ModelMixin, ConfigMixin):
                         "log_scale": animate2_log_scale,
                     }
                     if animate2_cached:
-                        animate2_ref_handoff = [animate2_cache["blocks"][block_idx].to(device=x_list[0].device, dtype=modulation_dtype)]
+                        animate2_ref_handoff = [animate2_load_cached(animate2_cache["blocks"][block_idx], x_list[0].device, modulation_dtype)]
                         x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=None, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation, animate2_cached=True)
                     else:
-                        if animate2_cache is not None:
-                            animate2_cache["blocks"].append(animate2_ref_hidden.detach().to(animate2_ref_hidden.device if animate2_kv_cache == "GPU" else "cpu", copy=True))
+                        if animate2_cache is not None and animate2_kv_cache in ("INT8", "RAM"):  # the block stores its reference K/V
+                            cache_device = "cpu" if animate2_kv_cache == "RAM" else animate2_ref_hidden.device
+                            animate2_generation["store_kv"] = lambda ref_kv_list: animate2_cache["blocks"].append(animate2_store_kv(ref_kv_list, cache_device))
+                        elif animate2_cache is not None:
+                            animate2_cache["blocks"].append(animate2_ref_hidden.detach().to(animate2_ref_hidden.device, copy=True))
                         animate2_ref_handoff = [animate2_ref_hidden]
                         animate2_ref_hidden = None
                         animate2_ref_hidden, x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=animate2_ref_context_emb, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation)

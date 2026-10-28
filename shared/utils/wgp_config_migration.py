@@ -5,12 +5,12 @@ from decimal import Decimal, InvalidOperation
 from postprocessing.mmaudio import MMAUDIO_DEFAULT_MODE
 from postprocessing.mmaudio.audio_processor import MMAudioProcessor
 from postprocessing.seedvc_processor.audio_processor import SeedVCProcessor
-from shared.deepy.config import DEEPY_ENABLED_KEY, DEEPY_TEMPLATE_CONFIG_MIGRATIONS
+from shared.deepy.config import DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_MIN, DEEPY_ENABLED_KEY, DEEPY_TEMPLATE_CONFIG_MIGRATIONS
 
 
 LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY = "_extensions_defaults_migrated"
 EXTENSIONS_DEFAULTS_VERSION_KEY = "extensions_defaults_version"
-EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.29")
+EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.30")
 EXTENSIONS_DEFAULTS_TARGET_VERSION_TEXT = str(EXTENSIONS_DEFAULTS_TARGET_VERSION)
 INSTALLED_REMOTE_PLUGINS_KEY = "installed_remote_plugins"
 
@@ -304,6 +304,10 @@ def migrate_extension_defaults(server_config, server_config_filename="", *, work
         server_config["compile"] = "disabled"
         changed = True
 
+    if version < Decimal("1.30") and DEEPY_CONTEXT_TOKENS_KEY in server_config and _to_int(server_config[DEEPY_CONTEXT_TOKENS_KEY]) < DEEPY_CONTEXT_TOKENS_MIN:
+        server_config[DEEPY_CONTEXT_TOKENS_KEY] = DEEPY_CONTEXT_TOKENS_MIN  # Deepy context window: 20,480 tokens at least
+        changed = True
+
     if workspace_root is not None and version < Decimal('1.28'):
         # Also correct 1.27's overly broad skip of stale session lock files.
         from shared.deepy.session_store import migrate_session_folders
@@ -313,6 +317,8 @@ def migrate_extension_defaults(server_config, server_config_filename="", *, work
 
     changed = _migrate_audio_processors_config(server_config, version) or changed
     changed = _migrate_temporal_upsamplers_config(server_config) or changed
+    from postprocessing.memory import migrate_config as migrate_postprocessor_memory
+    changed = migrate_postprocessor_memory(server_config) or changed
 
     if server_config.pop(LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY, None) is not None:
         changed = True

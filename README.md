@@ -64,7 +64,67 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 ## 🔥 Latest Updates : 
 
-## 15th of October 2026: WanGP v18.17 - More Drama per Gigabyte
+## 27th of October 2026: WanGP v18.84 - The One World Generator
+
+###  New World Generators
+Create a world, then walk through it with the keyboard in the new **Worlds gallery**. Save your exploration to continue later, record the journey as a video, or capture a view for another generation. You don't need a 24 GB card to join in: **8 GB is enough to get started** and almost at **NO SPEED COST** thanks to **MMGPv4**. Don't expect miracles, though: near-real-time exploration depends on the model and a fast, recent GPU.
+
+- **Hy-Nomas 8B** starts from a text description and remembers earlier views to help keep places and characters consistent. Walk around, turn the camera, or type an event such as "the fox sits down". Choose how much history it remembers and trade generation quality for quicker moves.
+
+- **EVOKE Turbo 14B** starts from an image and keeps a memory of the scene's depth, helping places retain their layout when you return to them. It is a good fit for exploring streets, landscapes and interiors at **640×384**, though moves take longer to generate.
+
+### Business as usual
+- **H3 PTD RefAsymOPD**  another **high-quality PDD 8 steps**, the trick is here to apply a different LoRA at each step (as a consequence you will need 11GB extra RAM) 
+
+- **H3 LoRAs Accelerators**: new **FL2V v1.3 / v1.1** and **Ref2V v1.0 / v1.1** accelerators.
+
+- **Two MOSS Image Editors**: **Edit SFT** changes clothing, backgrounds, lighting or style and combines up to **four ordered references**. **Edit HQ v4** focuses on localized changes to a single image while preserving surrounding details; combining multiple images is more limited.
+
+- **Fast Quantized KV Cache**: **MOSS Image Edit**, **Qwen Image 2.1** and **Wan Animate 2** now support quantized KV caches that make generation from image or video references much faster, even with **memory profiles 4 and 5**.
+
+- **More Speed Boost and VRAM Savers**: update **WGPKernels to 1.4.2** and **GGUF kernels to 1.0.29** using the [installation guide](docs/INSTALLATION.md).
+
+### Deepy Prime — Twice the Context, More Ways to Create
+
+Thanks to the new **Q4 KV cache**, Deepy Prime can fit **roughly twice the context within the same VRAM budget**, or use less VRAM at your current context size.
+
+Deepy Prime, your built-in personal assistant, can now:
+
+- **Search the web** for facts and visual references, read pages and download assets. Web access is optional and off by default; no search API key is needed.
+
+- **Find and install compatible LoRAs** from Civitai and Hugging Face for your chosen style or effect. Civitai downloads need your API key.
+
+- **Create with Python**: add exact lettering, draw charts, assemble contact sheets, write timed subtitles, animate titles and build procedural 3D props in a restricted sandbox.
+
+- **Automate batches** of image inspection, transcription and generation without filling the conversation with intermediate steps.
+
+- **Generate 3D assets and worlds**, or continue a saved world from movement instructions before exploring it yourself.
+
+- **Run Media Flow from chat**: restore, outpaint, upscale or smooth long videos and whole folders, with resumable batches and original audio preserved.
+
+
+## 21st of October 2026: WanGP v18.21 - No GPU Left Behind
+
+- **Profile 0 — More Speed with Less RAM (Experimental)**: a new, fully automated mode. WanGP gives fast Reserved RAM and spare VRAM to the model currently running, then makes those resources available to the next task. This makes switching between large models much friendlier to low-RAM PCs. Higher-end PCs may still get better results by choosing a profile manually.
+
+- **RTX 20XX Gets a Second Wind**: older RTX cards now benefit from the new **WGPKernels 1.3.0** (please check *docs/INSTALLATION.md*) and faster local language-model processing. LTX-2.5 image and video VAE encoding, decoding, and upscaling are measured **4.8–6.8× faster**, turning jobs that were painfully slow into practical workflows.
+
+- **Optimizations Across the Board**: many image, video, 3D, speech, and music models are now up to **10% faster** and use slightly less VRAM.
+
+- **Faster Deepy, Prompt Enhancer, Speech and Music**: WanGP automatically selects the best acceleration supported by your GPU. When a language model is too large for VRAM, the CPU can work on the part left in RAM while the GPU handles the rest—often making responses about twice as fast. For instance, you can now run **Deepy Prime** with **Qwen 3.8 Bonsai** on an RTX 2080 Ti at **60 tokens/s**.
+
+- **MiniMax H3 FastH3 Omni**: on RTX 30XX or newer, this new H3 variant combines the quality of the **PDD** process with **VSA sparse attention**. Best of all, it is an **omni** model that should work well for both **FL2VA** and **Ref2VA** workflows, which is why you will find it in the Ref2VA section. There is also an **NVFP4** variant that should bring the RTX 5090 close to real-time generation.
+
+- **More Flexible H3 Two-Pass Generation**: the second pass has its own **Phase 2 Steps** setting and can use your selected LoRA accelerators instead of the automatic Turbo LoRA. Put accelerator multipliers before `|` in **LoRAs Multipliers**: for example, `1;0.6 |` uses the selected accelerator at strength 1 in phase 1 and 0.6 in phase 2. Use `1;0 |` to keep it out of phase 2 and retain the automatic Turbo LoRA there.
+
+- **Fibo 2.0**: ranked as the **best open-source image generator**, it can also edit with up to **four references** or replace a masked area. **Edit Turbo** makes edits in only four steps. Prompts can be simple descriptions or structured captions, with extra help for rendering the intended text.
+
+- **FlashVSR+ Turbo**: a new FlashVSR model that restores richer detail and runs faster at high resolutions. It supports images and videos, from **1× refinement to 4× upscaling**. Select it under **Configuration → Extensions → FlashVSR Spatial Upsampling → Model**.
+
+- **Useful Extras and Fixes**: `--offline` prevents all downloads and clearly reports missing files. Linux DLSS Frame Generation x2 is easier to install, and several audio-model compatibility issues are fixed.
+
+
+## 18h of October 2026: WanGP v18.19 - More Drama per Gigabyte
 
 - **Flux 3 Klein 5.6B**: text-to-image generation and editing with up to **10 reference images**. Choose the distilled model for **16-step generation**, or Base for **50 steps with guidance**. Both come in BF16, INT8 ConvRot and NVFP4. The new **Prompt Helper** lets you draw layout boxes, place elements from reference images, and mark objects for removal. Boxes guide the composition; they do not act as exact pixel masks.
 
@@ -80,7 +140,12 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 - **MOSS Image 5B**: a new text-to-image family from **OpenMOSS**, with **Base** and **SFT** variants. Describe a scene in plain language, use tags, or arrange text and objects with the **Prompt Helper** layout editor. SFT adds training on curated data; both start at **50 steps**. The optional layout enhancer follows your selected canvas size. Boxes guide the composition; text and placement can still vary.
 
-*Update v18.17*: added MOSS Image 
+- **MOSS-TTS v1.5**: **8B** and **Local 4B** multilingual speech models with cloning of up to **three voices**, dialogue, adjustable pauses and optional script writing. Both support **BF16 / INT8 ConvRot** and **PyTorch / CUDA Graphs / vLLM**; Local 4B outputs **48 kHz stereo**.
+
+- **Krea 2 Edit v2**: **General Edit** for changes to colors, lighting, objects and style; **Identity Edit** for changing poses, outfits and scenes while preserving likeness. Both use **Krea 2 Turbo**, support **two reference images** and start at **8 steps**.
+
+*Update v18.17*: added MOSS Image\
+*Update v18.19*: lots of bugs fixes, MOSS TTS, Krea Edit v2
 
 ## 11th of October 2026: WanGP v18.00 - Distortion of Space and Time
 
@@ -132,8 +197,6 @@ These VRAM savings should benefit everyone, especially at higher resolutions and
 To get the most out of this update, first make sure you use *Sage2/2+ Attention* as quite a few optimizations depends on it. Then open the new *Config → RAM/VRAM Management* tab, choose an *MMGP Optimized VRAM Allocator* option under *VRAM Allocator*, and turn on *Smart Memory Pinning*. Restart WanGP if you change the allocator.
 
 For an extra **20% VRAM saving**, with a speed penalty of up to 10%, go to *Config → Performance* and set *Attention Head Split* to *Medium (good balance)*. A pretty good trade-off when every gigabyte counts.
-
-For faster model checkpoint loading on Windows, enable *Read Ahead (Windows)* in *RAM/VRAM Management*.
 
 **Dynamic VRAM Preload** fills spare VRAM with model weights and frees space as needed. Set *VRAM Preload* to *Dynamic* for less waiting between layers, especially when generating images.
 

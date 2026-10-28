@@ -14,6 +14,24 @@ from shared.gradio import metadata_events
 
 
 _EDITOR_PATH = Path(__file__).parent / 'wangp_image_editor/templates/component/index.js'
+# Gradio's upload control and the editor's bundled upload action must resolve
+# gallery previews identically. Fetch the original only when a drop occurs.
+_GALLERY_DROP_FILES = r'''async function wangpGalleryDropFiles(event) {
+    const files = Array.from(event.dataTransfer.files);
+    const media = event.dataTransfer.getData('application/x-wangp-gallery-media');
+    const source = media || event.dataTransfer.getData('text/uri-list').split(/\r?\n/).find(line => line && !line.startsWith('#'));
+    if (!source || !URL.canParse(source)) return files;
+    const url = new URL(source);
+    if (url.origin !== location.origin || !url.pathname.includes('/file=') || (!media && !url.searchParams.has('__wangp_gallery_preview'))) return files;
+    // Replace the browser's reduced-resolution image File entirely.
+    url.searchParams.delete('__wangp_gallery_preview');
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Could Not Load Original Gallery Media.');
+    const blob = await response.blob();
+    const name = decodeURIComponent(url.pathname.split('/file=')[1]).split(/[\\/]/).pop();
+    return [new File([blob], name, {type: blob.type})];
+}
+'''
 # Pixi's scheduler only serves wall-clock GC tasks in this bundle. Retain its
 # callbacks, offsets and repeat bookkeeping, but wake at their actual deadlines.
 # The separate pointer ticker must still run whenever hit testing unpauses it.
@@ -115,6 +133,67 @@ export function wangpScheduleUpdate(callback) {
     wangpUpdateJobs.push(callback);
     wangpUpdateChannel.port2.postMessage(0);
 }
+// Gradio copies every incoming object prop, so Svelte sees a new choices list,
+// elem_classes array or editor layer/brush option on each form refresh even when
+// the content is identical, and re-runs every reactive statement reading it
+// (option lists, editor tool setup with its forced layouts). A content-equal
+// object prop is the prop the component already holds: do not assign it.
+// value and loading_status keep Gradio's handling: a value carries output
+// semantics and a status is published once per actual change by Mn.
+function wangpSameProp(previous, next) {
+    if (previous === null || typeof previous !== "object" || previous instanceof Map || previous instanceof Set || next instanceof Map || next instanceof Set) return false;
+    try { return JSON.stringify(previous) === JSON.stringify(next); } catch { return false; }
+}
+// An unchanged primitive value is the value the bound component already holds
+// and shows; Svelte would not invalidate it. Skip it together with its
+// value_is_output mark (the mark carries the incoming value), so the component
+// runs no update cycle for it: Textbox reads layout before every update and
+// Slider rewrites its range input, both forcing a layout of the whole form.
+// Object values keep Gradio's handling: components react to their identity.
+// Gradio hands every event-stream message to its own setTimeout(0). Chrome
+// throttles those timers in a hidden tab (one per second, less after five
+// minutes), so a generation running while the page is away leaves a backlog
+// of intermediate outputs that replays, one flush each, when the tab returns.
+// Queue the messages instead and drain them in one task. An intermediate
+// process_generating output superseded by a later one in the same batch still
+// feeds the client's accumulated diff, but no longer reaches the components:
+// the page goes straight to the newest state. A foreground page has no
+// backlog, so every message is still applied as before.
+const wangpStreamQueues = new Map();
+let wangpStreamDrain = null;
+function wangpStreamEnqueue(id, handler, message) {
+    let queue = wangpStreamQueues.get(id);
+    if (!queue) wangpStreamQueues.set(id, queue = {handler, messages: []});
+    queue.handler = handler;
+    queue.messages.push(message);
+    if (wangpStreamDrain === null) wangpStreamDrain = setTimeout(wangpStreamFlush, 0);
+}
+function wangpStreamFlush() {
+    wangpStreamDrain = null;
+    const queues = [...wangpStreamQueues.values()];
+    wangpStreamQueues.clear();
+    for (const {handler, messages} of queues) {
+        for (let i = 0; i < messages.length; i++) {
+            const message = messages[i];
+            if (message.msg === "process_generating" && !message.output?.render_config) {
+                const next = messages.slice(i + 1).find(later => later.msg === "process_generating" || later.msg === "process_completed");
+                if (next?.msg === "process_generating") message.wangp_superseded = true;
+            }
+            handler(message);
+        }
+    }
+}
+function wangpSkipUpdate(node, update, next) {
+    const prop = update.prop;
+    // A label/visibility-only update clears the mark; a node whose mark is already
+    // cleared has nothing to apply (Svelte would not invalidate it either).
+    if (prop === "value_is_output" && next === false && node.props.value_is_output === false) return true;
+    if (prop === "value" || (prop === "value_is_output" && next === true && "wangpValue" in update)) {
+        const value = prop === "value" ? next : update.wangpValue;
+        return (value === null || typeof value !== "object") && Object.is(node.props.value, value);
+    }
+    return prop !== "loading_status" && next !== null && typeof next === "object" && wangpSameProp(node.props[prop], next);
+}
 """
 # Gradio's status store replaces an entry on each actual status/progress change.
 # Mn also runs after data messages and visits previously completed outputs. Do
@@ -169,9 +248,18 @@ function wangpGalleryVideoPoster(video) {
     }, "image/jpeg", 0.9));
 }
 function wangpGalleryVideoMount(video) {
+    if (video.dataset.testid?.startsWith("thumbnail ")) wangpGalleryThumbnailPoster(video, video.src);
     if (video.dataset.testid === "detailed-video") queueMicrotask(() => {
         if (video.isConnected) wangpGalleryVideoSource(video, video.src);
     });
+}
+function wangpGalleryThumbnailPoster(video, src) {
+    const url = new URL(src, document.baseURI);
+    if (url.origin !== location.origin || !url.pathname.includes('/file=')) return;
+    // Set this during mount, before the browser starts resource selection.
+    video.preload = 'none';
+    url.searchParams.set('__wangp_gallery_preview', 'video');
+    video.poster = url.href;
 }
 function wangpGalleryPosterEntry(video, src) {
     const entry = {src, value: null};
@@ -191,6 +279,7 @@ function wangpGalleryVideoError(event) {
     event.currentTarget.removeAttribute("poster");
 }
 function wangpGalleryVideoSource(video, src) {
+    if (video.dataset.testid?.startsWith("thumbnail ")) wangpGalleryThumbnailPoster(video, src);
     if (video.dataset.testid !== "detailed-video" || !video.closest(".gallery-container")) {
         j(video, "src", src);
         return;
@@ -253,6 +342,13 @@ _PATCHES = {
         ('async function f(){await Promise.all([n.set([125,140]),r.set([-125,-140])]),await Promise.all([n.set([-125,140]),r.set([125,-140])]),await Promise.all([n.set([-125,0]),r.set([125,-0])]),await Promise.all([n.set([125,0]),r.set([-125,0])])}', 'async function f(){for(const [left,right] of [[[125,140],[-125,-140]],[[-125,140],[125,-140]],[[-125,0],[125,0]],[[125,0],[-125,0]]]){if(u)return;await Promise.all([n.set(left),r.set(right)])}}'),
         ('return rt(()=>(a(),()=>u=!0))', 'return rt(()=>(a(),()=>{u=!0;n.set([0,0],{hard:!0});r.set([0,0],{hard:!0})}))'),
     ],
+    'Textbox-pyOssf2O.js': [
+        # The autoscroll check reads the textarea's scroll geometry before every
+        # update, forcing a layout of the whole form between the flush's DOM
+        # writes. Only a value change can move the scroll position: a label or
+        # visibility update needs no read and performs no scroll.
+        ('tt(()=>{x=v&&v.offsetHeight+v.scrollTop>v.scrollHeight-100})', 'tt(()=>{x=v&&(l.$$.dirty[0]&1)!==0&&v.offsetHeight+v.scrollTop>v.scrollHeight-100})'),
+    ],
     'AudioPlayer-DG1QBBp6.js': [
         # Svelte invalidates timeRef after this DOM write, re-running the
         # reactive waveform.on() statement and leaking a listener each tick.
@@ -278,6 +374,10 @@ _PATCHES = {
         ('c[0]&1024&&n.value!==i[10]&&me(n,i[10])', 'c[0]&1024&&wangpModelInput(n,i[10])'),
     ],
     'Tabs-DtiML6DO.js': [
+        # Every tab registration during a form refresh starts a measurement after
+        # the same tick; each one reads layout between the flush's DOM writes.
+        # One measurement after that tick sees the same final DOM.
+        ('async function V(){if(!w)return;await We();', 'let wangpTabsMeasuring=false;async function V(){if(!w||wangpTabsMeasuring)return;wangpTabsMeasuring=true;await We();wangpTabsMeasuring=false;'),
         # Test whether all tabs fit without the overflow trigger first. Its
         # existing width otherwise keeps the last tab trapped in overflow.
         ('let p=s.width;const D=ye(b,J);', '''if (!s.width) return;
@@ -300,6 +400,15 @@ _PATCHES = {
         ('d(e,"svelte-1pijsyv",!0)},i:m', 'd(e,"svelte-1pijsyv",!0),window.WanGPImageZoom.mount(e)},i:m'),
         ('d(t){t&&b(e),i=!1', 'd(t){window.WanGPImageZoom.destroy(e);t&&b(e),i=!1'),
     ],
+    'Upload-B_zkKtR-.js': [
+        ('function it(){', _GALLERY_DROP_FILES + 'function it(){'),
+        ('function s(f){if(f.preventDefault(),f.stopPropagation(),e.on_drag_change?.(!1),!f.dataTransfer?.files)return;const c=Array.from(f.dataTransfer.files);c.length>0&&e.on_files?.(c)}',
+         'async function s(f){if(f.preventDefault(),f.stopPropagation(),e.on_drag_change?.(!1),!f.dataTransfer?.files)return;try{const c=await wangpGalleryDropFiles(f);c.length>0&&e.on_files?.(c)}catch(error){e.on_error?.(error.message)}}'),
+        ('on_files:t[31],accepted_types:', 'on_files:t[31],on_error:t[32],accepted_types:'),
+        ('on_files:a[31],accepted_types:', 'on_files:a[31],on_error:a[32],accepted_types:'),
+        ('l,o,i,qe]}class Pt', 'l,o,i,qe,message=>A("error",message)]}class Pt'),
+        ('const h=Array.from(r.dataTransfer.files).filter(ae);', 'let h;try{h=(await wangpGalleryDropFiles(r)).filter(ae)}catch(error){A("error",error.message);return;}'),
+    ],
     'Gallery-D7vc32lN.js': [
         ('function Ve(s){', '''function wangpGalleryGap(event) {
             const container = event.target.closest('.thumbnails, .grid-container');
@@ -314,9 +423,26 @@ _PATCHES = {
             }
             if (closest) {event.preventDefault(); event.stopPropagation(); closest.click();}
         }
+        function wangpGalleryDrag(event) {
+            const thumbnail = event.target.closest('.thumbnail-item[data-wangp-video-url]');
+            if (!thumbnail || !this.contains(thumbnail)) return;
+            const source = new URL(thumbnail.dataset.wangpVideoUrl, location.href).href;
+            event.dataTransfer.effectAllowed = 'copy';
+            event.dataTransfer.setData('application/x-wangp-gallery-media', source);
+            event.dataTransfer.setData('text/uri-list', source);
+            event.dataTransfer.setData('text/plain', source);
+        }
         function Ve(s){'''),
-        ('V=s,l(18,V)', 'V?.removeEventListener("click",wangpGalleryGap),V=s,V?.addEventListener("click",wangpGalleryGap),l(18,V)'),
-        ('function dt(n){', '''function wangpGalleryImage(src, edge) {
+        ('V=s,l(18,V)', 'V?.removeEventListener("click",wangpGalleryGap),V?.removeEventListener("dragstart",wangpGalleryDrag),V=s,V?.addEventListener("click",wangpGalleryGap),V?.addEventListener("dragstart",wangpGalleryDrag),l(18,V)'),
+        ('B(e,"class","thumbnail-item thumbnail-small svelte-842rpi")', 'B(e,"class","thumbnail-item thumbnail-small svelte-842rpi"),wangpGalleryVideoThumbnail(e,n[50])'),
+        ('B(e,"class","thumbnail-item thumbnail-lg svelte-842rpi")', 'B(e,"class","thumbnail-item thumbnail-lg svelte-842rpi"),wangpGalleryVideoThumbnail(e,n[47])'),
+        ('n=w;let m=l;', 'n=w;y[0]&65536&&wangpGalleryVideoThumbnail(e,n[50]);let m=l;'),
+        ('n=$;let y=l;', 'n=$;w[0]&65536&&wangpGalleryVideoThumbnail(e,n[47]);let y=l;'),
+        ('function dt(n){', '''function wangpGalleryVideoThumbnail(button, item) {
+            B(button, 'draggable', item.video ? 'true' : null);
+            B(button, 'data-wangp-video-url', item.video?.url);
+        }
+        function wangpGalleryImage(src, edge) {
             if (!src || !edge) return src;
             const url = new URL(src, window.location.href);
             if (url.origin !== window.location.origin || !url.pathname.includes('/file=') || !/\\.(png|jpe?g|webp|bmp|tiff?|gif)$/i.test(url.pathname)) return src;
@@ -362,9 +488,29 @@ _PATCHES = {
         ('_t(()=>{document.addEventListener("fullscreenchange",()=>{l(17,j=!!document.fullscreenElement)})})', '_t(()=>{const changed=()=>l(17,j=document.fullscreenElement===V);document.addEventListener("fullscreenchange",changed);return()=>document.removeEventListener("fullscreenchange",changed)})'),
     ],
     'index.js': [
+        ('function yq() {', _GALLERY_DROP_FILES + 'function yq() {'),
+        ('''function l(f) {
+        if (f.preventDefault(), f.stopPropagation(), e.on_drag_change?.(!1), !f.dataTransfer?.files) return;
+        const m = Array.from(f.dataTransfer.files);
+        m.length > 0 && e.on_files?.(m);
+      }''', '''async function l(f) {
+        if (f.preventDefault(), f.stopPropagation(), e.on_drag_change?.(!1), !f.dataTransfer?.files) return;
+        try {
+          const m = await wangpGalleryDropFiles(f);
+          if (m.length > 0) await e.on_files?.(m);
+        } catch (error) { e.on_error?.(error.message); }
+      }'''),
+        ('r[33]\n        ),\n        accepted_types:', 'r[33]\n        ),\n        on_error: message => r[32]("download_error", message),\n        accepted_types:'),
+        ('E[33]\n        ),\n        accepted_types:', 'E[33]\n        ),\n        on_error: message => E[32]("download_error", message),\n        accepted_types:'),
         ('jC.SchedulerSystem = XC;', _EDITOR_SCHEDULER + 'jC.SchedulerSystem = XC;'),
         ('this._pauseUpdate = e;', 'this._pauseUpdate = e; e ? this.removeTickerListener() : this.addTickerListener();'),
         ('this._tickerAdded || !this.domElement ||', 'this._pauseUpdate || this._tickerAdded || !this.domElement ||'),
+        # Every form refresh marks the editor value as output again (afterUpdate
+        # clears the flag), which re-runs the value sync with force_empty. The
+        # forced clear reset both Pixi canvases, rebuilt their cursors and read
+        # layout for each tool change even when nothing was drawn or loaded.
+        # Clear only when the editors hold something, as a user clear does.
+        ('if (await R0(), !wn() || (await Q(!0, !1, wn), !wn())) return;', 'if (await R0(), !wn() || (await Q(!1, !1, wn), !wn())) return;'),
     ],
     'Blocks-BMC4HgbM.js': [
         ('requestAnimationFrame(()=>{Jt(he,pe,oe)})', 'wangpScheduleUpdate(()=>{Jt(he,pe,oe)})'),
@@ -396,7 +542,7 @@ _PATCHES = {
         # A label/visibility/options update carries no new value. Marking it as
         # one makes editors interpret their old empty prop as a server clear.
         ('S?.map((de,he)=>({id:pe[he],prop:"value_is_output",value:!0}))',
-         'S?.map((de,he)=>({id:pe[he],prop:"value_is_output",value:!(de&&de.__type__==="update"&&!Object.prototype.hasOwnProperty.call(de,"value"))}))'),
+         'S?.map((de,he)=>({id:pe[he],prop:"value_is_output",value:!(de&&de.__type__==="update"&&!Object.prototype.hasOwnProperty.call(de,"value")),wangpValue:de&&de.__type__==="update"?de.value:de}))'),
         # Re-publish after a component clears its indicator or a layout rebuild.
         ('function Ao(S,J,K){', 'function Ao(S,J,K){wangpStatusCache.delete(String(S));'),
         ('function Bo(ae){', 'function Bo(ae){wangpStatusCache.clear();wangpPendingCache.clear();'),
@@ -418,6 +564,9 @@ _PATCHES = {
         ('function Qo(e,o,t,r){', _UPDATE_SCHEDULER + 'function Qo(e,o,t,r){'),
         ('uv(q)', 'wangpScheduleUpdate(q)'),
         ('function lf(e,o={}){', 'function lf(e,o={}){' + _NATIVE_EVENT_STREAM),
+        ('let h=e[_];typeof window<"u"&&typeof document<"u"?setTimeout(h,0,u):h(u)', 'let h=e[_];typeof window<"u"&&typeof document<"u"?wangpStreamEnqueue(_,h,u):h(u)'),
+        ('(ae==="generating"||ae==="streaming")&&(i({type:"status",time:new Date,...oe,stage:oe?.stage,queue:!0,endpoint:w,fn_index:b}),Y&&g.connection!=="stream"&&["sse_v2","sse_v2.1","sse_v3"].includes(j)&&af(B,I,Y));Y&&(i({type:"data",time:new Date,data:Ee(Y.data,g,m.components,"output",G.with_null_state),endpoint:w,fn_index:b}),',
+         '(ae==="generating"||ae==="streaming")&&(Xe.wangp_superseded||i({type:"status",time:new Date,...oe,stage:oe?.stage,queue:!0,endpoint:w,fn_index:b}),Y&&g.connection!=="stream"&&["sse_v2","sse_v2.1","sse_v3"].includes(j)&&af(B,I,Y));Y&&!Xe.wangp_superseded&&(i({type:"data",time:new Date,data:Ee(Y.data,g,m.components,"output",G.with_null_state),endpoint:w,fn_index:b}),'),
         # Inspect only the actual gallery-view output, never unrelated text.
         # Its whole response must be discarded before an old index can paint.
         ('for(let g=0;g<ge.length;g++)for(let P=0;', 'for(let g=0;g<ge.length;g++){const view=ge[g].find(v=>v&&v.prop==="value"&&s[v.id]?.props.elem_id==="wangp-gallery-view");if(view&&window.WanGPGallerySelection?.acceptView(view.value)===false)continue;for(let P=0;'),
@@ -438,7 +587,7 @@ _PATCHES = {
         # Clear its open flag so the next queued audio/UI update can reconnect.
         ('s.onerror=async function(){await Promise.all', 's.onerror=async function(){ze(r,n.abort_controller);await Promise.all'),
         ('function q(){l.update(k=>{for(let g=0;', 'function q(){l.update(k=>{const wangpDirty=new Set;for(let g=0;'),
-        ('f.props[v.prop]=j}return k}),ge=[]', 'f.props[v.prop]=j;' + _MARK_ANCESTORS + 'return k}),ge=[]'),
+        (':j=v.value,f.props[v.prop]=j}return k}),ge=[]', ':j=v.value;if(wangpSkipUpdate(f,v,j))continue;f.props[v.prop]=j;' + _MARK_ANCESTORS + 'return k}),ge=[]'),
         ('l.set(h)', 'Object.values(s).forEach(node=>node.__wangp_revision=(node.__wangp_revision||0)+1),l.set(h)'),
     ],
     'Index-Cuq53rtW.js': [

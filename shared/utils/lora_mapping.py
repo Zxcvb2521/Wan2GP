@@ -103,6 +103,8 @@ def convert_lora_keys(state_dict, module_names, target="wangp", fused_split_map=
     suffixes += tuple("." + suffix for suffix in _DECOMPOSED_LOKR)
     for key, value in state_dict.items():
         normalized = key.replace(".lora.", ".lora_").replace(".default.weight", ".weight")
+        if normalized.endswith((".lora_A", ".lora_B")):
+            normalized += ".weight"
         suffix = next((suffix for suffix in suffixes if normalized.endswith(suffix)), None)
         if suffix is None:
             result[key] = value
@@ -114,9 +116,15 @@ def convert_lora_keys(state_dict, module_names, target="wangp", fused_split_map=
                 raise ValueError(f"Unknown Kohya LoRA module: {encoded_name}")
             module = encoded[encoded_name]
         else:
-            for prefix in ("base_model.model.", "model.diffusion_model.", "diffusion_model.", "transformer."):
-                if module.startswith(prefix):
-                    module = module[len(prefix):]
+            # A checkpoint can genuinely have a child named "transformer".
+            # Strip serialization wrappers only until an actual target is found.
+            while module not in module_names:
+                for prefix in ("base_model.model.", "model.diffusion_model.", "diffusion_model.", "transformer."):
+                    if module.startswith(prefix):
+                        module = module[len(prefix):]
+                        break
+                else:
+                    break
         if target == "kohya":
             suffix = suffix.replace(".lora_A.", ".lora_down.").replace(".lora_B.", ".lora_up.")
             destination = "lora_unet_" + module.replace(".", "_") + suffix
